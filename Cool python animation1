@@ -1,0 +1,31 @@
+import threading
+import time
+import os
+
+# Define your cursed animation frames
+frames = [
+    "( ͡° ͜ʖ ͡°)", 
+    "( ͡°╭͜ʖ╮͡° )", 
+    "( ͡° ͜ʖ ͡°)>⌐■-■", 
+    "(⌐■_■)", 
+    "(╯°□°）╯︵ ┻━┻", 
+    "┬─┬ ノ( ゜-゜ノ)"
+]
+
+def animate():
+    while True:
+        for frame in frames:
+            os.system('cls' if os.name == 'nt' else 'clear')
+            print(f"\n\n{frame}\n\n")
+            time.sleep(0.3)
+
+# Start animation in background thread
+animation_thread = threading.Thread(target=animate, daemon=True)
+animation_thread.start()
+
+# Main program logic (fake productivity)
+for i in range(10):
+    print(f"Running task {i+1}/10... totally not AFK.")
+    time.sleep(1)
+
+print("Main task complete. Animation continues forever. 🌀")
