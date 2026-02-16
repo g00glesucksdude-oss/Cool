@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Feedback</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .container {
+            background: white;
+            border-radius: 16px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+            max-width: 700px;
+            width: 100%;
+            padding: 40px;
+            animation: slideIn 0.4s ease-out;
+        }
+
+        @keyframes slideIn {
+            from {
+                opacity: 0;
+                transform: translateY(20px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .context-section {
+            background: #f8f9fa;
+            border-left: 4px solid #667eea;
+            padding: 16px;
+            border-radius: 8px;
+            margin-bottom: 24px;
+        }
+
+        .context-section strong {
+            color: #667eea;
+            display: block;
+            margin-bottom: 8px;
+            font-size: 14px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .context-section p {
+            color: #495057;
+            line-height: 1.6;
+            margin-bottom: 12px;
+        }
+
+        .context-link {
+            color: #667eea;
+            text-decoration: none;
+            font-size: 14px;
+            font-weight: 500;
+            transition: color 0.2s;
+        }
+
+        .context-link:hover {
+            color: #764ba2;
+            text-decoration: underline;
+        }
+
+        h2 {
+            color: #212529;
+            font-size: 24px;
+            margin-bottom: 28px;
+            line-height: 1.4;
+        }
+
+        .result-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 12px 20px;
+            border-radius: 50px;
+            font-weight: 600;
+            font-size: 18px;
+            margin-bottom: 24px;
+            animation: pop 0.5s cubic-bezier(0.68, -0.55, 0.265, 1.55);
+        }
+
+        @keyframes pop {
+            0% { transform: scale(0); }
+            50% { transform: scale(1.1); }
+            100% { transform: scale(1); }
+        }
+
+        .result-badge.correct {
+            background: #d4edda;
+            color: #155724;
+        }
+
+        .result-badge.incorrect {
+            background: #f8d7da;
+            color: #721c24;
+        }
+
+        .result-badge::before {
+            content: '';
+            width: 24px;
+            height: 24px;
+            border-radius: 50%;
+            background-size: 16px;
+            background-position: center;
+            background-repeat: no-repeat;
+        }
+
+        .result-badge.correct::before {
+            background-color: #28a745;
+            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' fill='white' viewBox='0 0 24 24'%3E%3Cpath d='M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41L9 16.17z'/%3E%3C/svg%3E");
+        }
+
+        .result-badge.incorrect::before {
+            background-color: #dc3545;
+            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' fill='white' viewBox='0 0 24 24'%3E%3Cpath d='M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12 19 6.41z'/%3E%3C/svg%3E");
+        }
+
+        .info-box {
+            background: #f8f9fa;
+            border-radius: 8px;
+            padding: 16px;
+            margin-bottom: 16px;
+        }
+
+        .info-label {
+            font-weight: 600;
+            color: #6c757d;
+            font-size: 13px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 6px;
+        }
+
+        .info-content {
+            color: #212529;
+            font-size: 16px;
+            line-height: 1.6;
+        }
+
+        .explanation-box {
+            background: #e7f3ff;
+            border-left: 4px solid #0066cc;
+            padding: 16px;
+            border-radius: 8px;
+            margin-bottom: 28px;
+        }
+
+        .explanation-box .info-label {
+            color: #0066cc;
+        }
+
+        .next-button {
+            display: inline-block;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 14px 32px;
+            border-radius: 8px;
+            text-decoration: none;
+            font-weight: 600;
+            font-size: 16px;
+            transition: transform 0.2s, box-shadow 0.2s;
+            box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
+        }
+
+        .next-button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 20px rgba(102, 126, 234, 0.6);
+        }
+
+        .next-button:active {
+            transform: translateY(0);
+        }
+
+        @media (max-width: 600px) {
+            .container {
+                padding: 24px;
+            }
+
+            h2 {
+                font-size: 20px;
+            }
+
+            .result-badge {
+                font-size: 16px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        {% if question.context %}
+            <div class="context-section">
+                <strong>Context</strong>
+                <p>{{ question.context }}</p>
+                {% if question.source_file and question.source_snippet %}
+                    <a class="context-link" href="{{ url_for('show_source',
+                                        dataset=dataset,
+                                        filename=question.source_file,
+                                        snippet=question.source_snippet) }}">
+                        → More on context
+                    </a>
+                {% endif %}
+            </div>
+        {% endif %}
+
+        <h2>{{ question.question or question.statement }}</h2>
+
+        <div class="result-badge {% if correct %}correct{% else %}incorrect{% endif %}">
+            {% if correct %}Correct!{% else %}Incorrect{% endif %}
+        </div>
+
+        <div class="info-box">
+            <div class="info-label">Your Answer</div>
+            <div class="info-content">{{ user_answer }}</div>
+        </div>
+
+        <div class="explanation-box">
+            <div class="info-label">Explanation</div>
+            <div class="info-content">{{ explanation }}</div>
+        </div>
+
+        <a class="next-button" href="{{ url_for('quiz_question',
+                            dataset=dataset,
+                            qtype=qtype,
+                            index=next_index) }}">
+            Next Question →
+        </a>
+    </div>
+
+    <!-- Play sound after submit -->
+    {% if correct %}
+        <audio autoplay>
+            <source src="{{ url_for('static', filename='correct.mp3') }}" type="audio/mpeg">
+        </audio>
+    {% else %}
+        <audio autoplay>
+            <source src="{{ url_for('static', filename='wrong.mp3') }}" type="audio/mpeg">
+        </audio>
+    {% endif %}
+</body>
+</html>

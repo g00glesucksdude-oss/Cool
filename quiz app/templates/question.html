@@ -1,0 +1,430 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Quiz Question</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .container {
+            background: white;
+            border-radius: 16px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+            max-width: 700px;
+            width: 100%;
+            padding: 40px;
+            animation: slideIn 0.4s ease-out;
+        }
+
+        @keyframes slideIn {
+            from {
+                opacity: 0;
+                transform: translateY(20px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .context-section {
+            background: #f8f9fa;
+            border-left: 4px solid #667eea;
+            padding: 16px;
+            border-radius: 8px;
+            margin-bottom: 24px;
+        }
+
+        .context-section strong {
+            color: #667eea;
+            display: block;
+            margin-bottom: 8px;
+            font-size: 14px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .context-section p {
+            color: #495057;
+            line-height: 1.6;
+            margin-bottom: 12px;
+        }
+
+        .context-link {
+            color: #667eea;
+            text-decoration: none;
+            font-size: 14px;
+            font-weight: 500;
+            transition: color 0.2s;
+        }
+
+        .context-link:hover {
+            color: #764ba2;
+            text-decoration: underline;
+        }
+
+        h2 {
+            color: #212529;
+            font-size: 24px;
+            margin-bottom: 28px;
+            line-height: 1.4;
+        }
+
+        /* Multiple Choice & Flashcard Styles */
+        .options-container {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            margin-bottom: 20px;
+        }
+
+        .option-label {
+            position: relative;
+            display: flex;
+            align-items: center;
+            padding: 16px 20px;
+            background: #f8f9fa;
+            border: 2px solid #e9ecef;
+            border-radius: 12px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            user-select: none;
+        }
+
+        .option-label:hover {
+            background: #e7f3ff;
+            border-color: #667eea;
+            transform: translateX(4px);
+        }
+
+        .option-label input[type="radio"] {
+            position: absolute;
+            opacity: 0;
+            cursor: pointer;
+        }
+
+        .option-label .radio-custom {
+            width: 24px;
+            height: 24px;
+            border: 2px solid #adb5bd;
+            border-radius: 50%;
+            margin-right: 16px;
+            position: relative;
+            transition: all 0.3s ease;
+            flex-shrink: 0;
+        }
+
+        .option-label:hover .radio-custom {
+            border-color: #667eea;
+        }
+
+        .option-label input[type="radio"]:checked ~ .radio-custom {
+            border-color: #667eea;
+            background: #667eea;
+        }
+
+        .option-label input[type="radio"]:checked ~ .radio-custom::after {
+            content: '';
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            width: 10px;
+            height: 10px;
+            background: white;
+            border-radius: 50%;
+        }
+
+        .option-text {
+            color: #212529;
+            font-size: 16px;
+            line-height: 1.5;
+        }
+
+        .option-label.correct {
+            background: #d4edda;
+            border-color: #28a745;
+            animation: pulse 0.5s ease;
+        }
+
+        .option-label.incorrect {
+            background: #f8d7da;
+            border-color: #dc3545;
+            animation: shake 0.5s ease;
+        }
+
+        @keyframes pulse {
+            0%, 100% { transform: scale(1); }
+            50% { transform: scale(1.02); }
+        }
+
+        @keyframes shake {
+            0%, 100% { transform: translateX(0); }
+            25% { transform: translateX(-10px); }
+            75% { transform: translateX(10px); }
+        }
+
+        /* Flashcard Button Styles */
+        .flashcard-buttons {
+            display: flex;
+            gap: 16px;
+            margin-top: 20px;
+        }
+
+        .flashcard-btn {
+            flex: 1;
+            padding: 16px 24px;
+            font-size: 18px;
+            font-weight: 600;
+            border: none;
+            border-radius: 12px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+        }
+
+        .flashcard-btn.true-btn {
+            background: linear-gradient(135deg, #28a745 0%, #20c997 100%);
+            color: white;
+        }
+
+        .flashcard-btn.false-btn {
+            background: linear-gradient(135deg, #dc3545 0%, #fd7e14 100%);
+            color: white;
+        }
+
+        .flashcard-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 20px rgba(0, 0, 0, 0.2);
+        }
+
+        .flashcard-btn:active {
+            transform: translateY(0);
+        }
+
+        /* Type Answer Form Styles */
+        .answer-form {
+            margin-top: 20px;
+        }
+
+        .answer-input {
+            width: 100%;
+            padding: 16px 20px;
+            font-size: 16px;
+            border: 2px solid #e9ecef;
+            border-radius: 12px;
+            margin-bottom: 16px;
+            transition: all 0.3s ease;
+            font-family: inherit;
+        }
+
+        .answer-input:focus {
+            outline: none;
+            border-color: #667eea;
+            box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
+        }
+
+        .submit-btn {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 14px 32px;
+            border: none;
+            border-radius: 8px;
+            font-weight: 600;
+            font-size: 16px;
+            cursor: pointer;
+            transition: transform 0.2s, box-shadow 0.2s;
+            box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
+        }
+
+        .submit-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 20px rgba(102, 126, 234, 0.6);
+        }
+
+        .submit-btn:active {
+            transform: translateY(0);
+        }
+
+        /* Feedback overlay */
+        .feedback-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.5);
+            display: none;
+            align-items: center;
+            justify-content: center;
+            z-index: 1000;
+            animation: fadeIn 0.3s ease;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; }
+            to { opacity: 1; }
+        }
+
+        .feedback-message {
+            background: white;
+            padding: 40px;
+            border-radius: 16px;
+            text-align: center;
+            animation: scaleIn 0.3s ease;
+        }
+
+        @keyframes scaleIn {
+            from { transform: scale(0.8); }
+            to { transform: scale(1); }
+        }
+
+        .feedback-icon {
+            font-size: 64px;
+            margin-bottom: 16px;
+        }
+
+        .feedback-text {
+            font-size: 24px;
+            font-weight: 600;
+            color: #212529;
+        }
+
+        @media (max-width: 600px) {
+            .container {
+                padding: 24px;
+            }
+
+            h2 {
+                font-size: 20px;
+            }
+
+            .flashcard-buttons {
+                flex-direction: column;
+            }
+
+            .option-label {
+                padding: 14px 16px;
+            }
+
+            .option-text {
+                font-size: 15px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        {% if question.context %}
+            <div class="context-section">
+                <strong>Context</strong>
+                <p>{{ question.context }}</p>
+                {% if question.source_file and question.source_snippet %}
+                    <a class="context-link" href="{{ url_for('show_source',
+                                        dataset=dataset,
+                                        filename=question.source_file,
+                                        snippet=question.source_snippet) }}">
+                        → More on context
+                    </a>
+                {% endif %}
+            </div>
+        {% endif %}
+
+        <h2>{{ question.question or question.statement }}</h2>
+
+        <!-- Hidden correct answer for JS check -->
+        <input type="hidden" id="correctAnswer" value="{{ question.answer or question.expected_answer }}">
+
+        {% if question.type == "multiple_choice" %}
+            <div class="options-container">
+                {% for opt in question.options %}
+                    <label class="option-label">
+                        <input type="radio" name="answer" value="{{ opt }}" onclick="checkAnswer(this.value, this.parentElement)">
+                        <span class="radio-custom"></span>
+                        <span class="option-text">{{ opt }}</span>
+                    </label>
+                {% endfor %}
+            </div>
+        {% elif question.type == "flashcard" %}
+            <div class="flashcard-buttons">
+                <button class="flashcard-btn true-btn" onclick="checkAnswer('True', this)">✓ True</button>
+                <button class="flashcard-btn false-btn" onclick="checkAnswer('False', this)">✗ False</button>
+            </div>
+        {% else %}
+            <!-- For type_answer, still use submit -->
+            <form class="answer-form" method="post">
+                <input type="text" class="answer-input" name="answer" placeholder="Type your answer here..." required>
+                <button type="submit" class="submit-btn">Submit Answer</button>
+            </form>
+        {% endif %}
+    </div>
+
+    <!-- Feedback overlay -->
+    <div class="feedback-overlay" id="feedbackOverlay">
+        <div class="feedback-message">
+            <div class="feedback-icon" id="feedbackIcon"></div>
+            <div class="feedback-text" id="feedbackText"></div>
+        </div>
+    </div>
+
+    <script>
+    function checkAnswer(userAnswer, element) {
+        const correct = document.getElementById("correctAnswer").value.trim().toLowerCase();
+        const user = userAnswer.trim().toLowerCase();
+
+        if (user === "") return;
+
+        const isCorrect = user === correct;
+        const overlay = document.getElementById("feedbackOverlay");
+        const icon = document.getElementById("feedbackIcon");
+        const text = document.getElementById("feedbackText");
+
+        // Visual feedback on the selected element
+        if (element) {
+            if (isCorrect) {
+                element.classList.add('correct');
+            } else {
+                element.classList.add('incorrect');
+            }
+        }
+
+        // Show feedback overlay
+        if (isCorrect) {
+            icon.textContent = "✓";
+            icon.style.color = "#28a745";
+            text.textContent = "Correct!";
+            text.style.color = "#28a745";
+            new Audio("{{ url_for('static', filename='correct.mp3') }}").play();
+        } else {
+            icon.textContent = "✗";
+            icon.style.color = "#dc3545";
+            text.textContent = "Incorrect";
+            text.style.color = "#dc3545";
+            new Audio("{{ url_for('static', filename='wrong.mp3') }}").play();
+        }
+
+        overlay.style.display = "flex";
+
+        // Navigate to next question
+        setTimeout(() => {
+            window.location.href = "{{ url_for('quiz_question', dataset=dataset, qtype=qtype, index=index+1) }}";
+        }, isCorrect ? 1500 : 2000);
+    }
+    </script>
+</body>
+</html>
