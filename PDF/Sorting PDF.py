@@ -179,7 +179,7 @@ def browse_file():
 # --- GUI Setup ---
 root = tk.Tk()
 root.title("PDF Splitter - Odd/Even with A-D-C-B Pattern")
-root.geometry("500x400")
+root.geometry("500x500")
 root.resizable(False, False)
 
 # Configure style
