@@ -3,9 +3,10 @@ from tkinter import Tk, filedialog, messagebox
 from pypdf import PdfReader, PdfWriter
 
 def reverse_pdfs():
-    # Hide the main Tkinter root window
+    # Initialize and hide the main Tkinter root window
     root = Tk()
     root.withdraw()
+    root.update() # Ensures the hidden state is processed by the OS
 
     # Logic: Open file dialog for multiple selection
     files = filedialog.askopenfilenames(
@@ -14,7 +15,7 @@ def reverse_pdfs():
     )
 
     if not files:
-        print("No files selected.")
+        root.destroy()
         return
 
     success_count = 0
@@ -24,16 +25,17 @@ def reverse_pdfs():
             reader = PdfReader(file_path)
             writer = PdfWriter()
 
-            # Reverse page logic: iterate N-1 down to 0
-            for i in range(len(reader.pages) - 1, -1, -1):
-                writer.add_page(reader.pages[i])
+            # Logic: Use the built-in reversed iterator for cleaner code
+            for page in reversed(reader.pages):
+                writer.add_page(page)
 
             # Output naming: file.pdf -> file_reversed.pdf
             base, ext = os.path.splitext(file_path)
             output_path = f"{base}_reversed{ext}"
 
-            with open(output_path, "wb") as f:
-                writer.write(f)
+            # Write the file
+            with open(output_path, "wb") as output_file:
+                writer.write(output_file)
             
             success_count += 1
             print(f"Reversed: {os.path.basename(output_path)}")
@@ -42,7 +44,9 @@ def reverse_pdfs():
             print(f"Error processing {file_path}: {e}")
 
     # Final logic confirmation
-    messagebox.showinfo("Done", f"Successfully reversed {success_count} files.")
+    if success_count > 0:
+        messagebox.showinfo("Success", f"Successfully reversed {success_count} files.")
+    
     root.destroy()
 
 if __name__ == "__main__":
