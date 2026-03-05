@@ -1,9 +1,10 @@
+#!/usr/bin/env python3
+
 import os
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
-from PyPDF2 import PdfReader, PdfWriter
-
+from pypdf import PdfReader, PdfWriter
 
 def process_pdf(input_file, pages_per_chunk=95, reverse=True):
     base_dir = os.path.dirname(input_file)
@@ -17,7 +18,7 @@ def process_pdf(input_file, pages_per_chunk=95, reverse=True):
 
     page_order = list(range(total_pages))
     if reverse:
-        page_order = page_order[::-1]
+        page_order.reverse()
 
     for i in range(0, total_pages, pages_per_chunk):
         chunk = page_order[i:i + pages_per_chunk]
@@ -26,11 +27,13 @@ def process_pdf(input_file, pages_per_chunk=95, reverse=True):
         odd_writer = PdfWriter()
         even_writer = PdfWriter()
 
-        for position, page_index in enumerate(chunk):
-            if position % 2 == 0:
-                odd_writer.add_page(reader.pages[page_index])
+        for page_index in chunk:
+            page = reader.pages[page_index]
+            # Human-readable page number = page_index + 1
+            if (page_index + 1) % 2 == 1:
+                odd_writer.add_page(page)
             else:
-                even_writer.add_page(reader.pages[page_index])
+                even_writer.add_page(page)
 
         if len(odd_writer.pages) > 0:
             with open(os.path.join(odds_dir, f"odds_{label}.pdf"), "wb") as f:
@@ -40,8 +43,7 @@ def process_pdf(input_file, pages_per_chunk=95, reverse=True):
             with open(os.path.join(evens_dir, f"evens_{label}.pdf"), "wb") as f:
                 even_writer.write(f)
 
-    messagebox.showinfo("Done", f"Done! {total_pages} pages split into chunks of {pages_per_chunk}.\n\nOdds → odds/\nEvens → evens/")
-
+    messagebox.showinfo("Done", f"Processed {total_pages} pages into chunks of {pages_per_chunk}.\nOdds → odds/\nEvens → evens/")
 
 def browse_and_run():
     input_file = filedialog.askopenfilename(filetypes=[("PDF files", "*.pdf")])
@@ -52,7 +54,6 @@ def browse_and_run():
     except ValueError:
         pages_per_chunk = 95
     threading.Thread(target=process_pdf, args=(input_file, pages_per_chunk, reverse_var.get()), daemon=True).start()
-
 
 # ── GUI ────────────────────────────────────────────────────────────────────────
 
