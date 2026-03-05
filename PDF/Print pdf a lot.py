@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-
 import os
 import tkinter as tk
 from tkinter import filedialog, messagebox
@@ -41,10 +40,11 @@ def split_pdf(file_path, chunk_size=95, reverse=True):
         odd_path = os.path.join(odds_dir, f"odds_{chunk_id}.pdf")
         even_path = os.path.join(evens_dir, f"evens_{chunk_id}.pdf")
 
-        if odd_writer.get_num_pages() > 0:
+        if odd_writer.getNumPages() > 0:
             with open(odd_path, "wb") as f:
                 odd_writer.write(f)
-        if even_writer.get_num_pages() > 0:
+
+        if even_writer.getNumPages() > 0:
             with open(even_path, "wb") as f:
                 even_writer.write(f)
 
