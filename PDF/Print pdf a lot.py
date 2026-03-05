@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
+
 import os
 import tkinter as tk
 from tkinter import filedialog, messagebox
-from PyPDF2 import PdfReader, PdfWriter
+from pypdf import PdfReader, PdfWriter
 
 def split_pdf(file_path, chunk_size=95, reverse=True):
-    # Create output folders
     base_dir = os.path.dirname(file_path)
+
     odds_dir = os.path.join(base_dir, "odds")
     evens_dir = os.path.join(base_dir, "evens")
     os.makedirs(odds_dir, exist_ok=True)
@@ -15,54 +16,63 @@ def split_pdf(file_path, chunk_size=95, reverse=True):
     reader = PdfReader(file_path)
     total_pages = len(reader.pages)
 
-    # Reverse order if enabled
+    # Page index list
     page_numbers = list(range(total_pages))
     if reverse:
-        page_numbers = page_numbers[::-1]
+        page_numbers.reverse()
 
-    # Split into chunks
+    # Chunk loop
     for start in range(0, total_pages, chunk_size):
         end = min(start + chunk_size, total_pages)
-        chunk_pages = page_numbers[start:end]
+        chunk = page_numbers[start:end]
 
-        # Separate odds and evens
         odd_writer = PdfWriter()
         even_writer = PdfWriter()
 
-        for p in chunk_pages:
-            if (p + 1) % 2 == 1:  # human-readable odd
-                odd_writer.add_page(reader.pages[p])
+        for p in chunk:
+            page = reader.pages[p]
+
+            # Human-readable page number = p+1
+            if (p + 1) % 2 == 1:
+                odd_writer.add_page(page)
             else:
-                even_writer.add_page(reader.pages[p])
+                even_writer.add_page(page)
 
-        # Save chunk files
-        chunk_id = f"{start+1}-{end}"
-        odd_path = os.path.join(odds_dir, f"odds_{chunk_id}.pdf")
-        even_path = os.path.join(evens_dir, f"evens_{chunk_id}.pdf")
+        chunk_label = f"{start+1}-{end}"
 
-        if odd_writer.getNumPages() > 0:
+        odd_path = os.path.join(odds_dir, f"odds_{chunk_label}.pdf")
+        even_path = os.path.join(evens_dir, f"evens_{chunk_label}.pdf")
+
+        if len(odd_writer.pages) > 0:
             with open(odd_path, "wb") as f:
                 odd_writer.write(f)
 
-        if even_writer.getNumPages() > 0:
+        if len(even_writer.pages) > 0:
             with open(even_path, "wb") as f:
                 even_writer.write(f)
 
-    messagebox.showinfo("Done", f"PDF split into odds/evens chunks of {chunk_size} pages.")
+    messagebox.showinfo("Done", f"Split complete.\nChunks of {chunk_size} pages created.")
 
 def select_pdf():
     file_path = filedialog.askopenfilename(
         title="Select PDF",
         filetypes=[("PDF files", "*.pdf")]
     )
-    if file_path:
-        chunk_size = int(chunk_entry.get())
-        reverse = reverse_var.get()
-        split_pdf(file_path, chunk_size, reverse)
+    if not file_path:
+        return
 
-# GUI setup
+    try:
+        chunk_size = int(chunk_entry.get())
+    except ValueError:
+        messagebox.showerror("Error", "Chunk size must be a number.")
+        return
+
+    reverse = reverse_var.get()
+    split_pdf(file_path, chunk_size, reverse)
+
+# GUI
 root = tk.Tk()
-root.title("PDF Splitter Tool")
+root.title("PDF Chunk Splitter")
 
 tk.Label(root, text="Chunk size (default 95):").pack()
 chunk_entry = tk.Entry(root)
