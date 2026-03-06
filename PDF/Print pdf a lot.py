@@ -1,4 +1,4 @@
-i want it so instead of 95 pages and then split to ev#!/usr/bin/env python3
+#!/usr/bin/env python3
 import os
 import threading
 import tkinter as tk
