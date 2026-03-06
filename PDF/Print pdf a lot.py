@@ -6,7 +6,16 @@ from tkinter import filedialog, messagebox, ttk
 from pypdf import PdfReader, PdfWriter
 
 
-def process_pdf(input_file, pages_per_chunk=95, reverse_odd=False, reverse_even=True):
+def process_pdf(input_file, pages_per_chunk=95, printer_face_down=True):
+    """
+    printer_face_down=True  â†’ printer outputs 95â†’1 (last page first, face down).
+      The stack, when flipped, is already in correct order.
+      So both odds and evens are fed to the printer in NORMAL order (1,3,5... and 2,4,6...).
+
+    printer_face_down=False â†’ printer outputs 1â†’95 (first page first, face up).
+      The stack comes out in order, no natural flip happens.
+      So evens must be REVERSED so that page 2 lands behind page 1 after you manually flip.
+    """
     base_dir = os.path.dirname(input_file)
     odds_dir = os.path.join(base_dir, "odds")
     evens_dir = os.path.join(base_dir, "evens")
@@ -16,20 +25,14 @@ def process_pdf(input_file, pages_per_chunk=95, reverse_odd=False, reverse_even=
     reader = PdfReader(input_file)
     total_pages = len(reader.pages)
 
-    # Separate pages into odd and even lists by human-readable page number (1-based)
-    # These stay in natural document order first
-    odd_pages  = [p for p in range(total_pages) if (p + 1) % 2 == 1]  # pages 1,3,5,...
-    even_pages = [p for p in range(total_pages) if (p + 1) % 2 == 0]  # pages 2,4,6,...
+    # Natural document order, split by odd/even page number (1-based)
+    odd_pages  = [p for p in range(total_pages) if (p + 1) % 2 == 1]
+    even_pages = [p for p in range(total_pages) if (p + 1) % 2 == 0]
 
-    # Apply reversal AFTER separating, so each stream is independently reversed if needed.
-    # Default: odd stays normal, even is reversed so when you flip the printed odd stack,
-    # the first even lines up with the back of odd page 1.
-    if reverse_odd:
-        odd_pages.reverse()
-    if reverse_even:
+    # If printer is face-up (1â†’95), reverse evens so they align after flipping the odd stack
+    if not printer_face_down:
         even_pages.reverse()
 
-    # Chunk each stream independently by pages_per_chunk
     num_chunks = max(
         (len(odd_pages)  + pages_per_chunk - 1) // pages_per_chunk,
         (len(even_pages) + pages_per_chunk - 1) // pages_per_chunk,
@@ -43,8 +46,6 @@ def process_pdf(input_file, pages_per_chunk=95, reverse_odd=False, reverse_even=
         odd_chunk  = odd_pages[start:end]
         even_chunk = even_pages[start:end]
 
-        # Label by the 1-based position in each stream (e.g. stream positions 1-95, 96-190)
-        # This tells you which chunk number it is, not which document page numbers
         label_start = start + 1
         label_end   = start + max(len(odd_chunk), len(even_chunk))
         label = f"{label_start}-{label_end}"
@@ -63,69 +64,28 @@ def process_pdf(input_file, pages_per_chunk=95, reverse_odd=False, reverse_even=
             with open(os.path.join(evens_dir, f"evens_{label}.pdf"), "wb") as f:
                 even_writer.write(f)
 
-    rev_desc = []
-    if reverse_odd:
-        rev_desc.append("odds reversed")
-    if reverse_even:
-        rev_desc.append("evens reversed")
-    rev_str = ", ".join(rev_desc) if rev_desc else "no reversal"
-
+    order_desc = f"{pages_per_chunk}â†’1 (face-down)" if printer_face_down else f"1â†’{pages_per_chunk} (face-up)"
     messagebox.showinfo(
         "Done",
         f"Processed {total_pages} pages into {num_chunks} chunk(s) of up to "
         f"{pages_per_chunk} odds + {pages_per_chunk} evens.\n"
-        f"Order: {rev_str}\n"
+        f"Printer order: {order_desc}\n"
         f"Odds â†’ odds/\nEvens â†’ evens/",
     )
 
 
-def show_reverse_menu():
-    popup = tk.Toplevel(root)
-    popup.title("Reverse Options")
-    popup.resizable(False, False)
-    popup.grab_set()
-
-    tk.Label(popup, text="Which pages should be reversed?", font=("", 10, "bold")).grid(
-        row=0, column=0, columnspan=2, padx=16, pady=(14, 8)
-    )
-    tk.Label(
-        popup,
-        text="Default: odds normal, evens reversed.\n"
-             "This ensures evens line up correctly\n"
-             "when you flip your printed odd stack.",
-        fg="gray", justify="left"
-    ).grid(row=1, column=0, columnspan=2, sticky="w", padx=20, pady=(0, 8))
-
-    tk.Checkbutton(popup, text="Reverse Odd pages",  variable=reverse_odd_var).grid(
-        row=2, column=0, columnspan=2, sticky="w", padx=20, pady=3
-    )
-    tk.Checkbutton(popup, text="Reverse Even pages", variable=reverse_even_var).grid(
-        row=3, column=0, columnspan=2, sticky="w", padx=20, pady=3
-    )
-
-    def toggle_both():
-        both = reverse_odd_var.get() and reverse_even_var.get()
-        reverse_odd_var.set(not both)
-        reverse_even_var.set(not both)
-
-    tk.Button(popup, text="Toggle Both", command=toggle_both, width=14).grid(
-        row=4, column=0, padx=12, pady=(8, 14)
-    )
-    tk.Button(popup, text="OK", command=popup.destroy, width=10).grid(
-        row=4, column=1, padx=12, pady=(8, 14)
-    )
-
-    popup.wait_window()
-    update_reverse_label()
+def toggle_printer_order():
+    if printer_face_down_var.get():
+        pages = entry_pages.get() or "95"
+        btn_printer_order.config(text=f"ðŸ–¨ {pages}â†’1  (face-down)")
+    else:
+        pages = entry_pages.get() or "95"
+        btn_printer_order.config(text=f"ðŸ–¨ 1â†’{pages}  (face-up)")
 
 
-def update_reverse_label(*_):
-    parts = []
-    if reverse_odd_var.get():
-        parts.append("odds")
-    if reverse_even_var.get():
-        parts.append("evens")
-    lbl_reverse_status.config(text=f"Reversed: {', '.join(parts) if parts else 'none'}")
+def on_pages_change(*_):
+    # Keep the button label in sync when chunk size changes
+    toggle_printer_order()
 
 
 def browse_and_run():
@@ -138,7 +98,7 @@ def browse_and_run():
         pages_per_chunk = 95
     threading.Thread(
         target=process_pdf,
-        args=(input_file, pages_per_chunk, reverse_odd_var.get(), reverse_even_var.get()),
+        args=(input_file, pages_per_chunk, printer_face_down_var.get()),
         daemon=True,
     ).start()
 
@@ -147,22 +107,30 @@ def browse_and_run():
 root = tk.Tk()
 root.title("PDF Odd/Even Splitter")
 
-# Default: odd = normal (False), even = reversed (True)
-reverse_odd_var  = tk.BooleanVar(value=False)
-reverse_even_var = tk.BooleanVar(value=True)
+printer_face_down_var = tk.BooleanVar(value=True)
 
+# Row 0 â€” chunk size
 tk.Label(root, text="Pages per chunk\n(odds + evens separately):").grid(
     row=0, column=0, sticky="w", padx=8, pady=6
 )
 entry_pages = tk.Entry(root, width=10)
 entry_pages.insert(0, "95")
 entry_pages.grid(row=0, column=1, sticky="w", padx=8)
+entry_pages.bind("<KeyRelease>", on_pages_change)
 
-tk.Button(root, text="âš™ Reverse Optionsâ€¦", command=show_reverse_menu, width=20).grid(
-    row=1, column=0, sticky="w", padx=8, pady=(4, 0)
+# Row 1 â€” printer order toggle button
+tk.Label(root, text="Printer outputs:").grid(row=1, column=0, sticky="w", padx=8)
+btn_printer_order = tk.Checkbutton(
+    root,
+    text="ðŸ–¨ 95â†’1  (face-down)",
+    variable=printer_face_down_var,
+    command=toggle_printer_order,
+    indicatoron=False,
+    relief="raised",
+    width=20,
+    padx=6, pady=4,
 )
-lbl_reverse_status = tk.Label(root, text="Reversed: evens", fg="gray")
-lbl_reverse_status.grid(row=1, column=1, sticky="w", padx=8)
+btn_printer_order.grid(row=1, column=1, sticky="w", padx=8, pady=4)
 
 ttk.Separator(root, orient="horizontal").grid(
     row=2, columnspan=2, sticky="ew", padx=8, pady=8
