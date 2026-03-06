@@ -7,18 +7,6 @@ from pypdf import PdfReader, PdfWriter
 
 
 def process_single_pdf(input_file, output_base_dir, pages_per_chunk=95, printer_face_down=True):
-    """
-    Face-down printer (95â†’1):
-      Step 1 - reverse ALL pages to support printer's reverse output order
-      Step 2 - reverse evens AGAIN so they align correctly behind odds when flipped
-
-      Net effect:
-        Odds:  reversed once  â†’ feeds highest-to-lowest
-        Evens: reversed twice â†’ feeds lowest-to-highest (2, 4, 6...)
-
-    Face-up printer (1â†’95):
-      No reversals needed.
-    """
     pdf_name  = os.path.splitext(os.path.basename(input_file))[0]
     out_dir   = os.path.join(output_base_dir, pdf_name)
     odds_dir  = os.path.join(out_dir, "odds")
@@ -32,10 +20,10 @@ def process_single_pdf(input_file, output_base_dir, pages_per_chunk=95, printer_
     odd_pages  = [p for p in range(total_pages) if (p + 1) % 2 == 1]
     even_pages = [p for p in range(total_pages) if (p + 1) % 2 == 0]
 
+    # Face-down: printer outputs 95â†’1, so reverse evens so they align after flipping the odd stack
     if printer_face_down:
-        odd_pages.reverse()          # Step 1: reverse all (odds)
-        even_pages.reverse()         # Step 1: reverse all (evens)
-        even_pages.reverse()         # Step 2: reverse evens again
+        even_pages.reverse()
+    # Face-up: both in normal order
 
     num_chunks = max(
         (len(odd_pages)  + pages_per_chunk - 1) // pages_per_chunk,
