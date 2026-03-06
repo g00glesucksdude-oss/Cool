@@ -1,191 +1,75 @@
 #!/usr/bin/env python3
+
 import os
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from pypdf import PdfReader, PdfWriter
 
-
-def process_single_pdf(input_file, output_base_dir, pages_per_chunk=95, printer_face_down=True):
-    pdf_name  = os.path.splitext(os.path.basename(input_file))[0]
-    out_dir   = os.path.join(output_base_dir, pdf_name)
-    odds_dir  = os.path.join(out_dir, "odds")
-    evens_dir = os.path.join(out_dir, "evens")
-    os.makedirs(odds_dir,  exist_ok=True)
+def process_pdf(input_file, pages_per_chunk=95, reverse=True):
+    base_dir = os.path.dirname(input_file)
+    odds_dir = os.path.join(base_dir, "odds")
+    evens_dir = os.path.join(base_dir, "evens")
+    os.makedirs(odds_dir, exist_ok=True)
     os.makedirs(evens_dir, exist_ok=True)
 
     reader = PdfReader(input_file)
     total_pages = len(reader.pages)
 
-    odd_pages  = [p for p in range(total_pages) if (p + 1) % 2 == 1]
-    even_pages = [p for p in range(total_pages) if (p + 1) % 2 == 0]
+    page_order = list(range(total_pages))
+    if reverse:
+        page_order.reverse()
 
-    # Face-down: printer outputs 95â†’1, so reverse evens so they align after flipping the odd stack
-    if printer_face_down:
-        even_pages.reverse()
-    # Face-up: both in normal order
+    for i in range(0, total_pages, pages_per_chunk):
+        chunk = page_order[i:i + pages_per_chunk]
+        label = f"{i + 1}-{i + len(chunk)}"
 
-    num_chunks = max(
-        (len(odd_pages)  + pages_per_chunk - 1) // pages_per_chunk,
-        (len(even_pages) + pages_per_chunk - 1) // pages_per_chunk,
-        1,
-    )
+        odd_writer = PdfWriter()
+        even_writer = PdfWriter()
 
-    for chunk_idx in range(num_chunks):
-        start = chunk_idx * pages_per_chunk
-        end   = start + pages_per_chunk
+        for page_index in chunk:
+            page = reader.pages[page_index]
+            # Human-readable page number = page_index + 1
+            if (page_index + 1) % 2 == 1:
+                odd_writer.add_page(page)
+            else:
+                even_writer.add_page(page)
 
-        odd_chunk  = odd_pages[start:end]
-        even_chunk = even_pages[start:end]
-
-        label_start = start + 1
-        label_end   = start + max(len(odd_chunk), len(even_chunk))
-        label = f"{label_start}-{label_end}"
-
-        if odd_chunk:
-            odd_writer = PdfWriter()
-            for page_index in odd_chunk:
-                odd_writer.add_page(reader.pages[page_index])
+        if len(odd_writer.pages) > 0:
             with open(os.path.join(odds_dir, f"odds_{label}.pdf"), "wb") as f:
                 odd_writer.write(f)
 
-        if even_chunk:
-            even_writer = PdfWriter()
-            for page_index in even_chunk:
-                even_writer.add_page(reader.pages[page_index])
+        if len(even_writer.pages) > 0:
             with open(os.path.join(evens_dir, f"evens_{label}.pdf"), "wb") as f:
                 even_writer.write(f)
 
-    return total_pages, num_chunks
+    messagebox.showinfo("Done", f"Processed {total_pages} pages into chunks of {pages_per_chunk}.\nOdds â†’ odds/\nEvens â†’ evens/")
 
-
-def run_processing(mode, pages_per_chunk, printer_face_down, status_var, btn_run):
-    btn_run.config(state="disabled")
-
-    if mode == "file":
-        input_file = filedialog.askopenfilename(filetypes=[("PDF files", "*.pdf")])
-        if not input_file:
-            btn_run.config(state="normal")
-            return
-        pdf_files = [input_file]
-        output_base = os.path.dirname(input_file)
-    else:
-        folder = filedialog.askdirectory(title="Select folder containing PDFs")
-        if not folder:
-            btn_run.config(state="normal")
-            return
-        pdf_files = [
-            os.path.join(folder, f)
-            for f in os.listdir(folder)
-            if f.lower().endswith(".pdf")
-        ]
-        if not pdf_files:
-            messagebox.showwarning("No PDFs", "No PDF files found in that folder.")
-            btn_run.config(state="normal")
-            return
-        output_base = folder
-
-    total_files = len(pdf_files)
-    status_var.set(f"Processing 0 / {total_files}...")
-
-    results = []
-    for i, pdf_path in enumerate(pdf_files, 1):
-        status_var.set(f"Processing {i} / {total_files}: {os.path.basename(pdf_path)}")
-        try:
-            pages, chunks = process_single_pdf(
-                pdf_path, output_base, pages_per_chunk, printer_face_down
-            )
-            results.append(f"âœ“ {os.path.basename(pdf_path)}: {pages} pages, {chunks} chunk(s)")
-        except Exception as e:
-            results.append(f"âœ— {os.path.basename(pdf_path)}: ERROR â€” {e}")
-
-    status_var.set("Done!")
-    btn_run.config(state="normal")
-
-    order_desc = f"{pages_per_chunk}â†’1 (face-down)" if printer_face_down else f"1â†’{pages_per_chunk} (face-up)"
-    summary = "\n".join(results)
-    messagebox.showinfo(
-        "Done",
-        f"Finished {total_files} file(s).\nPrinter order: {order_desc}\n\n{summary}"
-    )
-
-
-def start_processing(mode):
+def browse_and_run():
+    input_file = filedialog.askopenfilename(filetypes=[("PDF files", "*.pdf")])
+    if not input_file:
+        return
     try:
         pages_per_chunk = int(entry_pages.get())
     except ValueError:
         pages_per_chunk = 95
-    threading.Thread(
-        target=run_processing,
-        args=(mode, pages_per_chunk, printer_face_down_var.get(), status_var, btn_run),
-        daemon=True,
-    ).start()
-
-
-def toggle_printer_order():
-    pages = entry_pages.get() or "95"
-    if printer_face_down_var.get():
-        btn_printer_order.config(text=f"ðŸ–¨  {pages}â†’1  (face-down)")
-    else:
-        btn_printer_order.config(text=f"ðŸ–¨  1â†’{pages}  (face-up)")
-
-
-def on_pages_change(*_):
-    toggle_printer_order()
-
+    threading.Thread(target=process_pdf, args=(input_file, pages_per_chunk, reverse_var.get()), daemon=True).start()
 
 # â”€â”€ GUI â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
 root = tk.Tk()
 root.title("PDF Odd/Even Splitter")
-root.resizable(False, False)
 
-printer_face_down_var = tk.BooleanVar(value=True)
-status_var = tk.StringVar(value="Ready.")
-
-# Row 0 â€” chunk size
-tk.Label(root, text="Pages per chunk\n(odds + evens separately):").grid(
-    row=0, column=0, sticky="w", padx=8, pady=6
-)
+tk.Label(root, text="Pages per chunk:").grid(row=0, column=0, sticky="w", padx=8, pady=6)
 entry_pages = tk.Entry(root, width=10)
 entry_pages.insert(0, "95")
 entry_pages.grid(row=0, column=1, sticky="w", padx=8)
-entry_pages.bind("<KeyRelease>", on_pages_change)
 
-# Row 1 â€” printer order toggle
-tk.Label(root, text="Printer outputs:").grid(row=1, column=0, sticky="w", padx=8)
-btn_printer_order = tk.Checkbutton(
-    root,
-    text="ðŸ–¨  95â†’1  (face-down)",
-    variable=printer_face_down_var,
-    command=toggle_printer_order,
-    indicatoron=False,
-    relief="raised",
-    width=22,
-    padx=6, pady=4,
-)
-btn_printer_order.grid(row=1, column=1, sticky="w", padx=8, pady=4)
+reverse_var = tk.BooleanVar(value=True)
+tk.Checkbutton(root, text="Reverse page order", variable=reverse_var).grid(row=1, column=1, sticky="w", padx=8)
 
-ttk.Separator(root, orient="horizontal").grid(
-    row=2, columnspan=2, sticky="ew", padx=8, pady=8
-)
+ttk.Separator(root, orient="horizontal").grid(row=2, columnspan=2, sticky="ew", padx=8, pady=8)
 
-# Row 3 â€” action buttons
-btn_run = tk.Button(
-    root, text="ðŸ“„ Select PDF & Run",
-    command=lambda: start_processing("file"),
-    width=22
-)
-btn_run.grid(row=3, column=0, padx=8, pady=4)
-
-tk.Button(
-    root, text="ðŸ“ Select Folder & Run",
-    command=lambda: start_processing("folder"),
-    width=22
-).grid(row=3, column=1, padx=8, pady=4)
-
-# Row 4 â€” status
-tk.Label(root, textvariable=status_var, fg="gray", anchor="w").grid(
-    row=4, column=0, columnspan=2, sticky="ew", padx=8, pady=(0, 8)
-)
+tk.Button(root, text="Select PDF & Run", command=browse_and_run, width=20).grid(row=3, column=1, padx=8, pady=8)
 
 root.mainloop()
