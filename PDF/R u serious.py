@@ -1,42 +1,41 @@
 import os
 import requests
-import subprocess
+import sys
 
-# Configuration
-FILE_NAME = "Print_pdf_a_lot.py"
-# Note: GitHub "blob" URLs must be converted to "raw" for downloading
+# Force the script to look in its own folder
+os.chdir(os.path.dirname(os.path.abspath(__file__)))
+
+# The two possible names it might be hiding under
+POSSIBLE_NAMES = ["Print pdf a lot.py", "Print_pdf_a_lot.py"]
 RAW_URL = "https://raw.githubusercontent.com/g00glesucksdude-oss/Cool/main/PDF/Print%20pdf%20a%20lot.py"
+FINAL_NAME = "Print_pdf_a_lot.py" # Let's stick to underscores to avoid OS issues
 
 def update_and_run():
-    # 1. Delete the current version if it exists
-    if os.path.exists(FILE_NAME):
-        print(f"Removing old version of {FILE_NAME}...")
-        os.remove(FILE_NAME)
+    # 1. DELETE BOTH POSSIBILITIES
+    for name in POSSIBLE_NAMES:
+        if os.path.exists(name):
+            try:
+                os.remove(name)
+                print(f"TRASHED: {name}")
+            except Exception as e:
+                print(f"COULD NOT DELETE {name}: {e}")
 
-    # 2. Download the latest version
-    print(f"Downloading latest version from GitHub...")
+    # 2. DOWNLOAD FRESH (Saving as underscores to be safe)
+    print("Downloading the latest update...")
     try:
-        response = requests.get(RAW_URL)
-        response.raise_for_status()  # Check for errors
-        
-        with open(FILE_NAME, "wb") as f:
-            f.write(response.content)
-        print("Download complete.")
-        
+        r = requests.get(RAW_URL, timeout=15)
+        r.raise_for_status()
+        with open(FINAL_NAME, "wb") as f:
+            f.write(r.content)
+        print(f"SAVED AS: {FINAL_NAME}")
     except Exception as e:
-        print(f"Failed to download file: {e}")
+        print(f"DOWNLOAD FAILED: {e}")
         return
 
-    # 3. Run the script
-    print(f"Launching {FILE_NAME}...\n" + "-"*20)
-    try:
-        # This runs the downloaded script using the current python interpreter
-        subprocess.run(["python", FILE_NAME], check=True)
-    except subprocess.CalledProcessError as e:
-        print(f"The script encountered an error during execution: {e}")
-    except FileNotFoundError:
-        # In some systems, the command is 'python3' instead of 'python'
-        subprocess.run(["python3", FILE_NAME], check=True)
+    # 3. RUN IT
+    print(f"LAUNCHING {FINAL_NAME}...\n" + "="*30)
+    # Using sys.executable ensures it uses YOUR python version
+    os.system(f'"{sys.executable}" "{FINAL_NAME}"')
 
 if __name__ == "__main__":
     update_and_run()
