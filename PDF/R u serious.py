@@ -3,57 +3,81 @@ import requests
 import sys
 import subprocess
 import time
+import shutil
 
-# Lock to current directory
+# 1. Lock to current directory
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
 POSSIBLE_NAMES = ["Print pdf a lot.py", "Print_pdf_a_lot.py"]
-# Use the base URL without query strings here
 RAW_URL = "https://raw.githubusercontent.com/g00glesucksdude-oss/Cool/main/PDF/Print%20pdf%20a%20lot.py"
 FINAL_NAME = "Print_pdf_a_lot.py"
 
-def delete_files(names):
-    """Cleanup helper to remove specific files if they exist."""
-    for name in names:
+def clean_everything():
+    """Nuke files and the pycache folder to prevent 'ghost' execution."""
+    for name in POSSIBLE_NAMES:
         if os.path.exists(name):
             try:
                 os.remove(name)
                 print(f"CLEANED: {name}")
             except Exception as e:
-                print(f"COULD NOT DELETE {name}: {e}")
+                print(f"DEL ERROR: {e}")
+    
+    # Even if you don't see it, Python might have hidden it
+    if os.path.exists("__pycache__"):
+        shutil.rmtree("__pycache__", ignore_errors=True)
+        print("NUKED: __pycache__")
+
+    # Give the OS a heartbeat to realize the files are actually gone
+    time.sleep(0.5)
 
 def update_and_run():
-    # 1. PRE-CLEAN: Clear any previous session remnants
-    delete_files(POSSIBLE_NAMES)
+    # Step 1: Clear the slate
+    clean_everything()
 
-    # 2. DOWNLOAD (With Cache-Buster)
-    # Appending a timestamp (?t=12345) forces GitHub to serve the latest version
-    cache_buster_url = f"{RAW_URL}?t={int(time.time())}"
-    print(f"Fetching fresh update from GitHub...")
+    # Step 2: Download with extreme cache-busting
+    print("Fetching fresh update...")
+    
+    # Headers to tell GitHub/CDNs/Proxies: "DO NOT GIVE ME CACHED DATA"
+    headers = {
+        "Cache-Control": "no-cache, no-store, must-revalidate",
+        "Pragma": "no-cache",
+        "Expires": "0"
+    }
+    
+    # Unique URL per second
+    cache_buster_url = f"{RAW_URL}?nocache={int(time.time())}"
     
     try:
-        r = requests.get(cache_buster_url, timeout=15)
-        r.raise_for_status()
-        with open(FINAL_NAME, "wb") as f:
-            f.write(r.content)
-        print(f"SAVED AS: {FINAL_NAME}")
+        # Using a Session to avoid socket-level reuse issues
+        with requests.Session() as s:
+            s.trust_env = False # Ignore system proxies
+            r = s.get(cache_buster_url, headers=headers, timeout=15)
+            r.raise_for_status()
+            
+            with open(FINAL_NAME, "wb") as f:
+                f.write(r.content)
+        print(f"SAVED FRESH: {FINAL_NAME}")
     except Exception as e:
         print(f"DOWNLOAD FAILED: {e}")
         return
 
-    # 3. RUN THE SCRIPT
+    # Step 3: Run with Environment Overrides
     print(f"LAUNCHING {FINAL_NAME}...\n" + "="*30)
+    
+    # Force Python to NOT write or use bytecode (.pyc) for this run
+    env_vars = os.environ.copy()
+    env_vars["PYTHONDONTWRITEBYTECODE"] = "1"
+    
     try:
-        # sys.executable ensures we use the same Python environment
-        subprocess.run([sys.executable, FINAL_NAME], check=True)
+        # -B flag is an extra layer of "Don't use cache"
+        subprocess.run([sys.executable, "-B", FINAL_NAME], check=True, env=env_vars)
     except subprocess.CalledProcessError as e:
-        print(f"SCRIPT CRASHED OR EXITED WITH ERROR: {e}")
+        print(f"\nSCRIPT CRASHED: {e}")
     except Exception as e:
-        print(f"EXECUTION FAILED: {e}")
+        print(f"\nEXECUTION ERROR: {e}")
     finally:
-        # 4. POST-CLEAN: Delete the file immediately after the process ends
         print("="*30 + "\nSession finished. Cleaning up...")
-        delete_files([FINAL_NAME])
+        clean_everything()
 
 if __name__ == "__main__":
     update_and_run()
