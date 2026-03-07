@@ -1,156 +1,97 @@
-#!/usr/bin/env python3
 import os
-import threading
-import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
-from pypdf import PdfReader, PdfWriter
+import fitz  # PyMuPDF
+import customtkinter as ctk
+from tkinter import filedialog, messagebox
 
+class PDFSplitterApp(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+        self.title("Logic-Corrected PDF Splitter")
+        self.geometry("500x400")
 
-def process_single_pdf(input_file, output_base_dir, pages_per_chunk=95):
-    pdf_name  = os.path.splitext(os.path.basename(input_file))[0]
-    out_dir   = os.path.join(output_base_dir, pdf_name)
-    odds_dir  = os.path.join(out_dir, "odds")
-    evens_dir = os.path.join(out_dir, "evens")
-    os.makedirs(odds_dir,  exist_ok=True)
-    os.makedirs(evens_dir, exist_ok=True)
+        self.chunk_size = ctk.IntVar(value=95)
+        
+        ctk.CTkLabel(self, text="Manual Duplex Logic Splitter", font=("Arial", 20, "bold")).pack(pady=20)
+        ctk.CTkLabel(self, text="Sheets per Batch (e.g., 95 odds / 95 evens):").pack()
+        ctk.CTkEntry(self, textvariable=self.chunk_size).pack(pady=5)
 
-    reader = PdfReader(input_file)
-    total_pages = len(reader.pages)
+        ctk.CTkButton(self, text="Process Single PDF", command=self.process_single).pack(pady=10)
+        ctk.CTkButton(self, text="Batch Process Folder", command=self.process_batch).pack(pady=10)
+        
+        self.status_label = ctk.CTkLabel(self, text="Ready", text_color="gray")
+        self.status_label.pack(pady=20)
 
-    # Split into odd and even by human-readable page number (1-based)
-    odd_pages  = [p for p in range(total_pages) if (p + 1) % 2 == 1]
-    even_pages = [p for p in range(total_pages) if (p + 1) % 2 == 0]
+    def split_logic(self, pdf_path, output_root):
+        doc = fitz.open(pdf_path)
+        base_name = os.path.splitext(os.path.basename(pdf_path))[0]
+        pdf_dir = os.path.join(output_root, base_name)
+        
+        odd_dir = os.path.join(pdf_dir, "odd")
+        even_dir = os.path.join(pdf_dir, "even")
+        os.makedirs(odd_dir, exist_ok=True)
+        os.makedirs(even_dir, exist_ok=True)
 
-    # Reverse evens after separation
-    even_pages.reverse()
+        # 1. Sort all pages into Odd and Even lists first
+        all_odds = [i for i in range(len(doc)) if i % 2 == 0] # Page 1, 3, 5...
+        all_evens = [i for i in range(len(doc)) if i % 2 != 0] # Page 2, 4, 6...
 
-    num_chunks = max(
-        (len(odd_pages)  + pages_per_chunk - 1) // pages_per_chunk,
-        (len(even_pages) + pages_per_chunk - 1) // pages_per_chunk,
-        1,
-    )
+        sheet_limit = self.chunk_size.get()
 
-    for chunk_idx in range(num_chunks):
-        start = chunk_idx * pages_per_chunk
-        end   = start + pages_per_chunk
+        # 2. Process ODD chunks (e.g., 95 sheets at a time)
+        for i in range(0, len(all_odds), sheet_limit):
+            chunk_num = (i // sheet_limit) + 1
+            subset = all_odds[i : i + sheet_limit]
+            
+            new_odd_doc = fitz.open()
+            for pg_idx in subset:
+                new_odd_doc.insert_pdf(doc, from_page=pg_idx, to_page=pg_idx)
+            
+            new_odd_doc.save(os.path.join(odd_dir, f"{base_name}_ODD_Batch_{chunk_num}.pdf"))
+            new_odd_doc.close()
 
-        odd_chunk  = odd_pages[start:end]
-        even_chunk = even_pages[start:end]
+        # 3. Process EVEN chunks (e.g., 95 sheets at a time)
+        for i in range(0, len(all_evens), sheet_limit):
+            chunk_num = (i // sheet_limit) + 1
+            subset = all_evens[i : i + sheet_limit]
+            
+            temp_even_doc = fitz.open()
+            for pg_idx in subset:
+                temp_even_doc.insert_pdf(doc, from_page=pg_idx, to_page=pg_idx)
+            
+            # REVERSE this specific batch for the manual flip
+            reversed_even = fitz.open()
+            for p_idx in reversed(range(len(temp_even_doc))):
+                reversed_even.insert_pdf(temp_even_doc, from_page=p_idx, to_page=p_idx)
+            
+            reversed_even.save(os.path.join(even_dir, f"{base_name}_EVEN_Batch_{chunk_num}_REVERSED.pdf"))
+            
+            temp_even_doc.close()
+            reversed_even.close()
 
-        label_start = start + 1
-        label_end   = start + max(len(odd_chunk), len(even_chunk))
-        label = f"{label_start}-{label_end}"
+        doc.close()
 
-        if odd_chunk:
-            odd_writer = PdfWriter()
-            for page_index in odd_chunk:
-                odd_writer.add_page(reader.pages[page_index])
-            with open(os.path.join(odds_dir, f"odds_{label}.pdf"), "wb") as f:
-                odd_writer.write(f)
+    def process_single(self):
+        file_path = filedialog.askopenfilename(filetypes=[("PDF files", "*.pdf")])
+        if file_path:
+            dest = filedialog.askdirectory(title="Select Output Destination")
+            if dest:
+                self.split_logic(file_path, dest)
+                messagebox.showinfo("Success", f"Done: {os.path.basename(file_path)}")
 
-        if even_chunk:
-            even_writer = PdfWriter()
-            for page_index in even_chunk:
-                even_writer.add_page(reader.pages[page_index])
-            with open(os.path.join(evens_dir, f"evens_{label}.pdf"), "wb") as f:
-                even_writer.write(f)
+    def process_batch(self):
+        source_folder = filedialog.askdirectory(title="Select Source Folder")
+        if not source_folder: return
+        dest_folder = filedialog.askdirectory(title="Select Output Destination")
+        if not dest_folder: return
 
-    return total_pages, num_chunks
+        count = 0
+        for root, _, files in os.walk(source_folder):
+            for file in files:
+                if file.lower().endswith(".pdf"):
+                    self.split_logic(os.path.join(root, file), dest_folder)
+                    count += 1
+        messagebox.showinfo("Success", f"Processed {count} PDFs.")
 
-
-def run_processing(mode, pages_per_chunk, status_var, btn_run):
-    btn_run.config(state="disabled")
-
-    if mode == "file":
-        input_file = filedialog.askopenfilename(filetypes=[("PDF files", "*.pdf")])
-        if not input_file:
-            btn_run.config(state="normal")
-            return
-        pdf_files = [input_file]
-        output_base = os.path.dirname(input_file)
-    else:
-        folder = filedialog.askdirectory(title="Select folder containing PDFs")
-        if not folder:
-            btn_run.config(state="normal")
-            return
-        pdf_files = [
-            os.path.join(folder, f)
-            for f in os.listdir(folder)
-            if f.lower().endswith(".pdf")
-        ]
-        if not pdf_files:
-            messagebox.showwarning("No PDFs", "No PDF files found in that folder.")
-            btn_run.config(state="normal")
-            return
-        output_base = folder
-
-    total_files = len(pdf_files)
-    status_var.set(f"Processing 0 / {total_files}...")
-
-    results = []
-    for i, pdf_path in enumerate(pdf_files, 1):
-        status_var.set(f"Processing {i} / {total_files}: {os.path.basename(pdf_path)}")
-        try:
-            pages, chunks = process_single_pdf(pdf_path, output_base, pages_per_chunk)
-            results.append(f"âœ“ {os.path.basename(pdf_path)}: {pages} pages, {chunks} chunk(s)")
-        except Exception as e:
-            results.append(f"âœ— {os.path.basename(pdf_path)}: ERROR â€” {e}")
-
-    status_var.set("Done!")
-    btn_run.config(state="normal")
-
-    summary = "\n".join(results)
-    messagebox.showinfo("Done", f"Finished {total_files} file(s).\n\n{summary}")
-
-
-def start_processing(mode):
-    try:
-        pages_per_chunk = int(entry_pages.get())
-    except ValueError:
-        pages_per_chunk = 95
-    threading.Thread(
-        target=run_processing,
-        args=(mode, pages_per_chunk, status_var, btn_run),
-        daemon=True,
-    ).start()
-
-
-# â”€â”€ GUI â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-root = tk.Tk()
-root.title("PDF Odd/Even Splitter")
-root.resizable(False, False)
-
-status_var = tk.StringVar(value="Ready.")
-
-# Row 0 â€” chunk size
-tk.Label(root, text="Pages per chunk\n(odds + evens separately):").grid(
-    row=0, column=0, sticky="w", padx=8, pady=6
-)
-entry_pages = tk.Entry(root, width=10)
-entry_pages.insert(0, "95")
-entry_pages.grid(row=0, column=1, sticky="w", padx=8)
-
-ttk.Separator(root, orient="horizontal").grid(
-    row=1, columnspan=2, sticky="ew", padx=8, pady=8
-)
-
-# Row 2 â€” action buttons
-btn_run = tk.Button(
-    root, text="ðŸ“„ Select PDF & Run",
-    command=lambda: start_processing("file"),
-    width=22
-)
-btn_run.grid(row=2, column=0, padx=8, pady=4)
-
-tk.Button(
-    root, text="ðŸ“ Select Folder & Run",
-    command=lambda: start_processing("folder"),
-    width=22
-).grid(row=2, column=1, padx=8, pady=4)
-
-# Row 3 â€” status
-tk.Label(root, textvariable=status_var, fg="gray", anchor="w").grid(
-    row=3, column=0, columnspan=2, sticky="ew", padx=8, pady=(0, 8)
-)
-
-root.mainloop()
+if __name__ == "__main__":
+    app = PDFSplitterApp()
+    app.mainloop()
