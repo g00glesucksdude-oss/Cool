@@ -32,7 +32,7 @@ class PDFSplitterApp(ctk.CTk):
         os.makedirs(even_dir, exist_ok=True)
 
         # 1. Sort all pages into Odd and Even lists first
-        all_odds = [i for i in range(len(doc)) if i % 2 == 0] # Page 1, 3, 5...
+        all_odds = [i for i in range(len(doc)) if i % 2 == 0]  # Page 1, 3, 5...
         all_evens = [i for i in range(len(doc)) if i % 2 != 0] # Page 2, 4, 6...
 
         sheet_limit = self.chunk_size.get()
@@ -54,19 +54,12 @@ class PDFSplitterApp(ctk.CTk):
             chunk_num = (i // sheet_limit) + 1
             subset = all_evens[i : i + sheet_limit]
             
-            temp_even_doc = fitz.open()
+            new_even_doc = fitz.open()
             for pg_idx in subset:
-                temp_even_doc.insert_pdf(doc, from_page=pg_idx, to_page=pg_idx)
+                new_even_doc.insert_pdf(doc, from_page=pg_idx, to_page=pg_idx)
             
-            # REVERSE this specific batch for the manual flip
-            reversed_even = fitz.open()
-            for p_idx in reversed(range(len(temp_even_doc))):
-                reversed_even.insert_pdf(temp_even_doc, from_page=p_idx, to_page=p_idx)
-            
-            reversed_even.save(os.path.join(even_dir, f"{base_name}_EVEN_Batch_{chunk_num}_REVERSED.pdf"))
-            
-            temp_even_doc.close()
-            reversed_even.close()
+            new_even_doc.save(os.path.join(even_dir, f"{base_name}_EVEN_Batch_{chunk_num}.pdf"))
+            new_even_doc.close()
 
         doc.close()
 
