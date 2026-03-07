@@ -42,24 +42,36 @@ class PDFSplitterApp(ctk.CTk):
             chunk_num = (i // sheet_limit) + 1
             subset = all_odds[i : i + sheet_limit]
             
-            new_odd_doc = fitz.open()
+            temp_odd_doc = fitz.open()
             for pg_idx in subset:
-                new_odd_doc.insert_pdf(doc, from_page=pg_idx, to_page=pg_idx)
-            
-            new_odd_doc.save(os.path.join(odd_dir, f"{base_name}_ODD_Batch_{chunk_num}.pdf"))
-            new_odd_doc.close()
+                temp_odd_doc.insert_pdf(doc, from_page=pg_idx, to_page=pg_idx)
+
+            # Reverse for correct duplex order
+            reversed_odd = fitz.open()
+            for p_idx in reversed(range(len(temp_odd_doc))):
+                reversed_odd.insert_pdf(temp_odd_doc, from_page=p_idx, to_page=p_idx)
+
+            reversed_odd.save(os.path.join(odd_dir, f"{base_name}_ODD_Batch_{chunk_num}_REVERSED.pdf"))
+            temp_odd_doc.close()
+            reversed_odd.close()
 
         # 3. Process EVEN chunks (e.g., 95 sheets at a time)
         for i in range(0, len(all_evens), sheet_limit):
             chunk_num = (i // sheet_limit) + 1
             subset = all_evens[i : i + sheet_limit]
             
-            new_even_doc = fitz.open()
+            temp_even_doc = fitz.open()
             for pg_idx in subset:
-                new_even_doc.insert_pdf(doc, from_page=pg_idx, to_page=pg_idx)
-            
-            new_even_doc.save(os.path.join(even_dir, f"{base_name}_EVEN_Batch_{chunk_num}.pdf"))
-            new_even_doc.close()
+                temp_even_doc.insert_pdf(doc, from_page=pg_idx, to_page=pg_idx)
+
+            # Reverse for correct duplex order
+            reversed_even = fitz.open()
+            for p_idx in reversed(range(len(temp_even_doc))):
+                reversed_even.insert_pdf(temp_even_doc, from_page=p_idx, to_page=p_idx)
+
+            reversed_even.save(os.path.join(even_dir, f"{base_name}_EVEN_Batch_{chunk_num}_REVERSED.pdf"))
+            temp_even_doc.close()
+            reversed_even.close()
 
         doc.close()
 
