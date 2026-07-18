@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Photo PDF Compiler</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: #121212; color: #e0e0e0; padding: 15px; margin: 0;
+  }
+  .card {
+    background: #1e1e1e; padding: 16px; border-radius: 12px;
+    margin-bottom: 15px; box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+  }
+  h2 { margin: 0 0 10px 0; color: #ff9500; font-size: 19px; }
+  .sub { font-size: 12px; color: #888; margin: -4px 0 12px 0; }
+  .flex-grid { display: flex; gap: 10px; margin-bottom: 10px; }
+  .input-box {
+    width: 100%; padding: 10px; background: #2a2a2a; border: 1px solid #444;
+    border-radius: 6px; color: white; font-size: 14px;
+  }
+  label { display: block; font-size: 13px; margin-bottom: 4px; color: #aaa; }
+  .btn {
+    display: block; width: 100%; padding: 12px; background: #ff9500; color: black;
+    border: none; border-radius: 8px; font-size: 15px; font-weight: bold;
+    margin-top: 8px; text-align: center; cursor: pointer;
+  }
+  .btn:disabled { opacity: 0.35; cursor: default; }
+  .btn-sec { background: #383838; color: #eee; }
+  .btn-go { background: #34c759; }
+  input[type="file"] { display: none; }
+  .drop-zone {
+    border: 2px dashed #444; border-radius: 10px; padding: 24px 12px;
+    text-align: center; color: #888; font-size: 14px; cursor: pointer;
+    transition: border-color .15s, color .15s;
+  }
+  .drop-zone.drag { border-color: #ff9500; color: #ff9500; }
+  .thumbs {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(64px, 1fr));
+    gap: 6px; max-height: 220px; overflow-y: auto; margin-top: 12px;
+  }
+  .thumb { position: relative; aspect-ratio: 1; border-radius: 6px; overflow: hidden; background: #2a2a2a; }
+  .thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .thumb .idx {
+    position: absolute; bottom: 2px; right: 4px; font-size: 9px; color: #fff;
+    background: rgba(0,0,0,0.6); border-radius: 3px; padding: 0 3px;
+  }
+  .count-line { font-size: 13px; color: #ccc; margin-top: 10px; }
+  .status { font-size: 13px; margin-top: 10px; min-height: 18px; }
+  .status.error { color: #ff453a; }
+  .status.done { color: #34c759; }
+  .status.running { color: #ffd60a; }
+  .progress-bar-outer { background: #2a2a2a; border-radius: 6px; height: 8px; margin-top: 8px; overflow: hidden; display: none; }
+  .progress-bar-inner { background: #ff9500; height: 100%; width: 0%; transition: width .2s; }
+  .page-previews { display: flex; gap: 8px; overflow-x: auto; margin-top: 12px; }
+  .page-previews img { height: 160px; border-radius: 6px; border: 1px solid #333; }
+  .note { font-size: 12px; color: #777; margin-top: 10px; line-height: 1.5; }
+</style>
+</head>
+<body>
+
+  <div class="card">
+    <h2>1. Add Photos</h2>
+    <div class="sub">Runs entirely in this browser tab — nothing is uploaded anywhere.</div>
+    <div class="drop-zone" id="drop-zone">Tap to choose photos, or drag & drop them here</div>
+    <input type="file" id="file-input" accept="image/*" multiple>
+    <div class="flex-grid" style="margin-top:10px;">
+      <button class="btn btn-sec" style="margin:0;" onclick="document.getElementById('file-input').click()">🖼️ Choose Photos</button>
+      <button class="btn btn-sec" style="margin:0;" id="clear-btn">🗑️ Clear</button>
+    </div>
+    <div class="count-line" id="count-line"></div>
+    <div class="thumbs" id="thumbs"></div>
+  </div>
+
+  <div class="card">
+    <h2>2. Configure</h2>
+    <div class="flex-grid">
+      <div style="flex:1;">
+        <label>Images / Page (target)</label>
+        <input type="number" id="base_count" class="input-box" value="16" min="1">
+      </div>
+      <div style="flex:1;">
+        <label>Max Squeeze (overflow)</label>
+        <input type="number" id="threshold" class="input-box" value="4" min="0">
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>3. Compile</h2>
+    <button class="btn btn-go" id="compile-btn" disabled>🚀 COMPILE OPTIMIZED PDF</button>
+    <div class="progress-bar-outer" id="progress-outer"><div class="progress-bar-inner" id="progress-inner"></div></div>
+    <div class="status" id="status-line"></div>
+    <div class="page-previews" id="page-previews"></div>
+    <div class="note">
+      Pages are justified-row layouts (like Google Photos' grid view) — every image
+      keeps its own aspect ratio, rows stretch to fill the full page width, and row
+      height is solved so rows also fill the page height. When your PDF finishes,
+      your browser will download it automatically (check your Downloads folder /
+      the browser's download bar).
+    </div>
+  </div>
+
+<script>
+const PAGE_W = 2480, PAGE_H = 3508; // A4 @ 300dpi
+let selectedFiles = []; // { file, url }
+
+const dropZone = document.getElementById('drop-zone');
+const fileInput = document.getElementById('file-input');
+const thumbsEl = document.getElementById('thumbs');
+const countLine = document.getElementById('count-line');
+const compileBtn = document.getElementById('compile-btn');
+const statusLine = document.getElementById('status-line');
+const progressOuter = document.getElementById('progress-outer');
+const progressInner = document.getElementById('progress-inner');
+const pagePreviews = document.getElementById('page-previews');
+
+dropZone.addEventListener('click', () => fileInput.click());
+['dragover','dragenter'].forEach(evt => dropZone.addEventListener(evt, e => {
+  e.preventDefault(); dropZone.classList.add('drag');
+}));
+['dragleave','drop'].forEach(evt => dropZone.addEventListener(evt, e => {
+  e.preventDefault(); dropZone.classList.remove('drag');
+}));
+dropZone.addEventListener('drop', e => {
+  const files = Array.from(e.dataTransfer.files).filter(f => f.type.startsWith('image/'));
+  addFiles(files);
+});
+fileInput.addEventListener('change', e => {
+  addFiles(Array.from(e.target.files));
+  fileInput.value = ''; // allow re-adding the same files later
+});
+document.getElementById('clear-btn').addEventListener('click', () => {
+  selectedFiles.forEach(f => URL.revokeObjectURL(f.url));
+  selectedFiles = [];
+  renderThumbs();
+});
+
+function addFiles(files) {
+  for (const file of files) {
+    selectedFiles.push({ file, url: URL.createObjectURL(file) });
+  }
+  selectedFiles.sort((a, b) => a.file.name.localeCompare(b.file.name));
+  renderThumbs();
+}
+
+function renderThumbs() {
+  thumbsEl.innerHTML = '';
+  selectedFiles.forEach((f, i) => {
+    const div = document.createElement('div');
+    div.className = 'thumb';
+    div.innerHTML = `<img src="${f.url}" loading="lazy"><span class="idx">${i + 1}</span>`;
+    thumbsEl.appendChild(div);
+  });
+  countLine.innerText = selectedFiles.length
+    ? `${selectedFiles.length} photo(s) selected`
+    : 'No photos selected yet';
+  compileBtn.disabled = selectedFiles.length === 0;
+}
+
+function buildBatches(items, targetPerPage, overflowThreshold) {
+  const total = items.length;
+  const batches = [];
+  let cursor = 0;
+  while (cursor < total) {
+    const remaining = total - cursor;
+    if (remaining <= targetPerPage + overflowThreshold) {
+      batches.push(items.slice(cursor));
+      break;
+    }
+    batches.push(items.slice(cursor, cursor + targetPerPage));
+    cursor += targetPerPage;
+  }
+  return batches;
+}
+
+// Justified-gallery row packing (Google Photos/Flickr style), with a guardrail
+// against force-stretching sparse leftover rows into oversized single images.
+// See conversation notes: a plain binary search on row height is NOT safe here,
+// because greedy row-packing can reflow abruptly as target height changes, so
+// total height isn't a smooth/monotonic function of target height. This scans
+// candidates directly instead of assuming monotonicity.
+function justifiedRows(imagesMeta, containerWidth, containerHeight, spacing = 0, samples = 400, maxStretch = 1.6) {
+  const n = imagesMeta.length;
+  if (n === 0) return [];
+
+  function buildRows(targetH) {
+    const rows = [];
+    let current = [], curW = 0;
+    for (const item of imagesMeta) {
+      const scaledW = item.w * (targetH / item.h);
+      let addW = scaledW + (current.length ? spacing : 0);
+      if (current.length && curW + addW > containerWidth) {
+        rows.push(current); current = []; curW = 0; addW = scaledW;
+      }
+      current.push({ item, scaledW });
+      curW += addW;
+    }
+    if (current.length) rows.push(current);
+    return rows;
+  }
+
+  function rowHeightAfterStretch(row, targetH) {
+    const sumW = row.reduce((s, r) => s + r.scaledW, 0) + spacing * (row.length - 1);
+    const scale = sumW > 0 ? containerWidth / sumW : 1;
+    return targetH * scale;
+  }
+
+  function totalHeightFor(targetH) {
+    const rows = buildRows(targetH);
+    let total = 0;
+    for (const row of rows) {
+      let rh = rowHeightAfterStretch(row, targetH);
+      if (rh > targetH * maxStretch) rh = targetH;
+      total += rh;
+    }
+    total += spacing * (rows.length - 1);
+    return { total, rows };
+  }
+
+  const meanAspect = imagesMeta.reduce((s, it) => s + it.w / it.h, 0) / n;
+  const guess = Math.sqrt((containerWidth * containerHeight) / (n * meanAspect));
+  const lo = Math.max(5, guess * 0.5), hi = guess * 1.8;
+
+  let best = null;
+  for (let i = 0; i < samples; i++) {
+    const t = lo + (hi - lo) * i / (samples - 1);
+    const { total, rows } = totalHeightFor(t);
+    if (total <= containerHeight) {
+      if (!best || total > best.total) best = { total, targetH: t, rows };
+    }
+  }
+  if (!best) {
+    const { total, rows } = totalHeightFor(lo);
+    best = { total, targetH: lo, rows };
+  }
+
+  const { targetH, rows } = best;
+  const layout = [];
+  let y = 0;
+  for (const row of rows) {
+    let rh = rowHeightAfterStretch(row, targetH);
+    if (rh > targetH * maxStretch) {
+      const rowH = targetH;
+      const totalW = row.reduce((s, r) => s + r.scaledW, 0) + spacing * (row.length - 1);
+      let x = (containerWidth - totalW) / 2;
+      const placed = [];
+      for (const { item, scaledW } of row) {
+        placed.push({ item, x, y, w: scaledW, h: rowH });
+        x += scaledW + spacing;
+      }
+      layout.push(placed);
+      y += rowH + spacing;
+    } else {
+      const sumW = row.reduce((s, r) => s + r.scaledW, 0) + spacing * (row.length - 1);
+      const scale = sumW > 0 ? containerWidth / sumW : 1;
+      const rowH = targetH * scale;
+      let x = 0;
+      const placed = [];
+      for (const { item, scaledW } of row) {
+        const w = scaledW * scale;
+        placed.push({ item, x, y, w, h: rowH });
+        x += w + spacing * scale;
+      }
+      layout.push(placed);
+      y += rowH + spacing;
+    }
+  }
+  return layout;
+}
+
+function loadImage(url) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = reject;
+    img.src = url;
+  });
+}
+
+function setStatus(text, kind) {
+  statusLine.className = 'status' + (kind ? ' ' + kind : '');
+  statusLine.innerText = text;
+}
+
+compileBtn.addEventListener('click', async () => {
+  const target = Math.max(1, parseInt(document.getElementById('base_count').value, 10) || 16);
+  const overflow = Math.max(0, parseInt(document.getElementById('threshold').value, 10) || 0);
+
+  compileBtn.disabled = true;
+  progressOuter.style.display = 'block';
+  progressInner.style.width = '0%';
+  pagePreviews.innerHTML = '';
+  setStatus('Loading images...', 'running');
+
+  try {
+    const loaded = [];
+    for (const f of selectedFiles) {
+      const img = await loadImage(f.url);
+      loaded.push({ w: img.naturalWidth, h: img.naturalHeight, img });
+    }
+
+    const batches = buildBatches(loaded, target, overflow);
+    const { jsPDF } = window.jspdf;
+    const doc = new jsPDF({ unit: 'pt', format: 'a4' });
+
+    for (let p = 0; p < batches.length; p++) {
+      setStatus(`Compiling page ${p + 1} of ${batches.length}...`, 'running');
+      progressInner.style.width = `${Math.round(((p) / batches.length) * 100)}%`;
+      // yield to the browser so the progress bar / status text actually repaints
+      await new Promise(r => setTimeout(r, 0));
+
+      const layout = justifiedRows(batches[p], PAGE_W, PAGE_H);
+      const canvas = document.createElement('canvas');
+      canvas.width = PAGE_W; canvas.height = PAGE_H;
+      const ctx = canvas.getContext('2d');
+      ctx.fillStyle = 'white';
+      ctx.fillRect(0, 0, PAGE_W, PAGE_H);
+
+      for (const row of layout) {
+        for (const { item, x, y, w, h } of row) {
+          ctx.drawImage(item.img, x, y, w, h);
+        }
+      }
+
+      const dataUrl = canvas.toDataURL('image/jpeg', 0.92);
+      if (p > 0) doc.addPage('a4', 'portrait');
+      doc.addImage(dataUrl, 'JPEG', 0, 0, 595.28, 841.89);
+
+      const previewImg = document.createElement('img');
+      previewImg.src = dataUrl;
+      pagePreviews.appendChild(previewImg);
+    }
+
+    progressInner.style.width = '100%';
+    doc.save('optimized_print.pdf');
+    setStatus(`Done — ${batches.length} page(s) compiled and downloaded.`, 'done');
+  } catch (err) {
+    console.error(err);
+    setStatus('Error: ' + err.message, 'error');
+  } finally {
+    compileBtn.disabled = false;
+  }
+});
+</script>
+</body>
+</html>
