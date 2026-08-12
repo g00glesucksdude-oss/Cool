@@ -1,0 +1,649 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GAN EO Tracker</title>
+<style>
+  :root{
+    --bg:#121212; --panel:#1e1e1e; --border:#333;
+    --green:#00ff66; --orange:#ff9900; --blue:#00bfff; --red:#ff4d4d;
+  }
+  *{box-sizing:border-box;}
+  body{
+    font-family: 'Courier New', monospace;
+    background-color: var(--bg);
+    color: var(--green);
+    padding: 16px;
+    margin:0;
+  }
+  h1{ font-size:1.3em; margin:0 0 4px; }
+  .sub{ color:#888; font-size:0.85em; margin-bottom:16px; }
+  .row{ display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin-bottom:12px; }
+  button{
+    padding: 10px 20px;
+    font-size: 15px;
+    font-weight: bold;
+    background-color: var(--green);
+    color: var(--bg);
+    border: none;
+    cursor: pointer;
+    border-radius: 4px;
+    font-family: inherit;
+  }
+  button:hover{ background-color:#00cc52; }
+  button.secondary{ background:#333; color:var(--green); }
+  button.secondary:hover{ background:#444; }
+  button.warn{ background:#ff9900; color:#121212; }
+  button.warn:hover{ background:#e68a00; }
+  input[type=text]{
+    background:#0a0a0a; color:var(--green); border:1px solid var(--border);
+    padding:8px; border-radius:4px; font-family:inherit; font-size:14px; width:180px;
+  }
+  select{
+    background:#0a0a0a; color:var(--green); border:1px solid var(--border);
+    padding:8px; border-radius:4px; font-family:inherit; font-size:14px;
+  }
+  .panel{
+    background: var(--panel); border:1px solid var(--border); border-radius:6px;
+    padding:14px; margin-bottom:14px;
+  }
+  .panel h2{ margin:0 0 10px; font-size:0.95em; color:var(--blue); text-transform:uppercase; letter-spacing:1px;}
+  .status-line{ font-size:0.9em; margin-bottom:4px; }
+  .summary{
+    font-size:1.4em; font-weight:bold; text-align:center; padding:10px 0;
+  }
+  .summary.allgood{ color:var(--green); }
+  .summary.hasbad{ color:var(--orange); }
+  .grid{
+    display:grid; grid-template-columns:repeat(4, 1fr); gap:8px;
+  }
+  .cell{
+    border-radius:4px; padding:10px 4px; text-align:center; font-weight:bold;
+    border:1px solid var(--border); font-size:0.95em;
+  }
+  .cell.good{ background:rgba(0,255,102,0.12); color:var(--green); border-color:var(--green); }
+  .cell.bad{ background:rgba(255,77,77,0.12); color:var(--red); border-color:var(--red); }
+  #log{
+    margin-top: 4px;
+    background: var(--panel);
+    padding: 10px;
+    border-radius: 4px;
+    height: 180px;
+    overflow-y: auto;
+    border: 1px solid var(--border);
+    font-size: 0.85em;
+  }
+  .move{ color: var(--orange); font-weight:bold; }
+  .info{ color: var(--blue); }
+  .error{ color: var(--red); }
+  .hint{ color:#777; font-size:0.8em; margin-top:6px; }
+  label{ font-size:0.85em; color:#aaa; }
+
+  /* Visualizer Styles */
+  .viz-wrapper {
+    display: flex;
+    gap: 30px;
+    flex-wrap: wrap;
+    justify-content: center;
+    align-items: center;
+    padding: 10px 0;
+  }
+  .perspective-container {
+    width: 140px;
+    height: 140px;
+    perspective: 500px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  #cube3d {
+    width: 80px;
+    height: 80px;
+    position: relative;
+    transform-style: preserve-3d;
+    transform: rotateX(-25deg) rotateY(45deg);
+    transition: transform 0.05s linear;
+  }
+  .face3d {
+    position: absolute;
+    width: 80px;
+    height: 80px;
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    grid-template-rows: repeat(3, 1fr);
+    gap: 2px;
+    background: #000;
+    padding: 2px;
+    border: 1px solid var(--border);
+    box-sizing: border-box;
+  }
+  .face3d.U { transform: rotateX(90deg) translateZ(40px); }
+  .face3d.D { transform: rotateX(-90deg) translateZ(40px); }
+  .face3d.F { transform: translateZ(40px); }
+  .face3d.B { transform: rotateY(180deg) translateZ(40px); }
+  .face3d.L { transform: rotateY(-90deg) translateZ(40px); }
+  .face3d.R { transform: rotateY(90deg) translateZ(40px); }
+
+  .net-container {
+    display: grid;
+    grid-template-columns: repeat(4, 50px);
+    grid-template-rows: repeat(3, 50px);
+    gap: 4px;
+  }
+  .net-face {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    grid-template-rows: repeat(3, 1fr);
+    gap: 1px;
+    background: #000;
+    padding: 1px;
+    border: 1px solid var(--border);
+  }
+  .net-face.U { grid-column: 2; grid-row: 1; }
+  .net-face.L { grid-column: 1; grid-row: 2; }
+  .net-face.F { grid-column: 2; grid-row: 2; }
+  .net-face.R { grid-column: 3; grid-row: 2; }
+  .net-face.B { grid-column: 4; grid-row: 2; }
+  .net-face.D { grid-column: 2; grid-row: 3; }
+
+  .sticker {
+    width: 100%;
+    height: 100%;
+    border-radius: 1px;
+    background-color: #222;
+    box-sizing: border-box;
+  }
+
+  .sticker.bad-glow {
+    box-shadow: inset 0 0 0 2px #ff0000, 0 0 8px #ff4d4d !important;
+    z-index: 5;
+    animation: pulse-glow 0.8s infinite alternate;
+  }
+
+  @keyframes pulse-glow {
+    from { filter: brightness(1.0); }
+    to { filter: brightness(1.6); }
+  }
+
+  /* Fixed Canonical Color Definitions */
+  .color-U { background-color: #ffffff; }
+  .color-R { background-color: #ff3333; }
+  .color-F { background-color: #00e600; }
+  .color-D { background-color: #ffdd00; }
+  .color-L { background-color: #ff8800; }
+  .color-B { background-color: #0066ff; }
+</style>
+</head>
+<body>
+
+<h1>GAN EO Tracker</h1>
+<div class="sub">Live edge-orientation tracking (Virtual State Engine)</div>
+
+<div class="panel">
+  <h2>Connection & Controls</h2>
+  <div class="row">
+    <input type="text" id="macInput" value="54:6C:50:9D:F1:0C" placeholder="Cube MAC address">
+    <button id="connectBtn">Connect Cube</button>
+    <button id="disconnectBtn" class="secondary" disabled>Disconnect</button>
+    <button id="resetStateBtn" class="warn">Reset Virtual State (SOLVED)</button>
+    <button id="resetGyroBtn" class="secondary">Reset Gyro Baseline</button>
+  </div>
+  <div class="status-line" id="connStatus">Not connected.</div>
+  <div class="status-line" id="battStatus"></div>
+</div>
+
+<div class="panel">
+  <h2>Visualizer (Bad Edges Glow Red)</h2>
+  <div class="viz-wrapper">
+    <div class="perspective-container">
+      <div id="cube3d">
+        <div class="face3d U" data-face="U"></div>
+        <div class="face3d L" data-face="L"></div>
+        <div class="face3d F" data-face="F"></div>
+        <div class="face3d R" data-face="R"></div>
+        <div class="face3d B" data-face="B"></div>
+        <div class="face3d D" data-face="D"></div>
+      </div>
+    </div>
+    <div class="net-container">
+      <div class="net-face U" data-face="U"></div>
+      <div class="net-face L" data-face="L"></div>
+      <div class="net-face F" data-face="F"></div>
+      <div class="net-face R" data-face="R"></div>
+      <div class="net-face B" data-face="B"></div>
+      <div class="net-face D" data-face="D"></div>
+    </div>
+  </div>
+</div>
+
+<div class="panel">
+  <h2>Settings</h2>
+  <div class="row">
+    <label for="axisSelect">EO axis preference:</label>
+    <select id="axisSelect">
+      <option value="FB">Front/Back (standard ZZ EOLine)</option>
+      <option value="UD">Up/Down</option>
+      <option value="RL">Right/Left</option>
+    </select>
+  </div>
+
+  <div class="row">
+    <label for="colorSchemeSelect">Color Orientation Preset:</label>
+    <select id="colorSchemeSelect">
+      <option value="YG">Yellow Top / Green Front</option>
+      <option value="WG">White Top / Green Front (Standard WCA)</option>
+      <option value="YB">Yellow Top / Blue Front</option>
+      <option value="WB">White Top / Blue Front</option>
+    </select>
+  </div>
+  <div class="hint">FB is standard ZZ EOLine — bad edges glow red in visualizer.</div>
+</div>
+
+<div class="panel">
+  <h2>Edge Orientation</h2>
+  <div class="summary" id="summary">Connect cube or move to track</div>
+  <div class="grid" id="edgeGrid"></div>
+</div>
+
+<div class="panel">
+  <h2>Move Log</h2>
+  <div id="log">Ready.<br></div>
+</div>
+
+<script type="module">
+  import { connectGanCube } from 'https://esm.sh/gan-web-bluetooth';
+
+  // 1. DOM Element Bindings
+  const logDiv = document.getElementById('log');
+  const connectBtn = document.getElementById('connectBtn');
+  const disconnectBtn = document.getElementById('disconnectBtn');
+  const resetStateBtn = document.getElementById('resetStateBtn');
+  const resetGyroBtn = document.getElementById('resetGyroBtn');
+  const macInput = document.getElementById('macInput');
+  const connStatus = document.getElementById('connStatus');
+  const battStatus = document.getElementById('battStatus');
+  const axisSelect = document.getElementById('axisSelect');
+  const colorSchemeSelect = document.getElementById('colorSchemeSelect');
+  const summaryDiv = document.getElementById('summary');
+  const edgeGrid = document.getElementById('edgeGrid');
+  const cube3D = document.getElementById('cube3d');
+
+  // 2. Color Schemes & Solved States Definition (Physical positions U, R, F, D, L, B)
+  const COLOR_SCHEMES = {
+    'YG': {
+      name: 'Yellow Top / Green Front',
+      solved: 'DDDDDDDDDLLLLLLLLLFFFFFFFFFUUUUUUUUURRRRRRRRRBBBBBBBBB'
+    },
+    'WG': {
+      name: 'White Top / Green Front (Standard WCA)',
+      solved: 'UUUUUUUUURRRRRRRRRFFFFFFFFFDDDDDDDDDLLLLLLLLLBBBBBBBBB'
+    },
+    'YB': {
+      name: 'Yellow Top / Blue Front',
+      solved: 'DDDDDDDDDRRRRRRRRRBBBBBBBBBUUUUUUUUULLLLLLLLLFFFFFFFFF'
+    },
+    'WB': {
+      name: 'White Top / Blue Front',
+      solved: 'UUUUUUUUULLLLLLLLLBBBBBBBBBDDDDDDDDDRRRRRRRRRFFFFFFFFF'
+    }
+  };
+
+  let conn = null;
+  let gyroBaseline = { pitch: 0, yaw: 0, roll: 0 };
+  let currentRawEuler = { pitch: 0, yaw: 0, roll: 0 };
+
+  function getSolvedFacelets() {
+    const scheme = colorSchemeSelect.value;
+    return COLOR_SCHEMES[scheme] ? COLOR_SCHEMES[scheme].solved : COLOR_SCHEMES['YG'].solved;
+  }
+
+  let currentFacelets = getSolvedFacelets();
+
+  const FACE_ORDER = ['U', 'R', 'F', 'D', 'L', 'B'];
+
+  const EDGES = [
+    { name:'UR', faces:['U','R'], idx:[5,10] },
+    { name:'UF', faces:['U','F'], idx:[7,19] },
+    { name:'UL', faces:['U','L'], idx:[3,37] },
+    { name:'UB', faces:['U','B'], idx:[1,46] },
+    { name:'DR', faces:['D','R'], idx:[32,16] },
+    { name:'DF', faces:['D','F'], idx:[28,25] },
+    { name:'DL', faces:['D','L'], idx:[30,43] },
+    { name:'DB', faces:['D','B'], idx:[34,52] },
+    { name:'FR', faces:['F','R'], idx:[23,12] },
+    { name:'FL', faces:['F','L'], idx:[21,41] },
+    { name:'BL', faces:['B','L'], idx:[50,39] },
+    { name:'BR', faces:['B','R'], idx:[48,14] },
+  ];
+
+  const EDGE_STICKER_MAP = {
+    UR: [{ face: 'U', idx: 5 }, { face: 'R', idx: 1 }],
+    UF: [{ face: 'U', idx: 7 }, { face: 'F', idx: 1 }],
+    UL: [{ face: 'U', idx: 3 }, { face: 'L', idx: 1 }],
+    UB: [{ face: 'U', idx: 1 }, { face: 'B', idx: 1 }],
+    DR: [{ face: 'D', idx: 5 }, { face: 'R', idx: 7 }],
+    DF: [{ face: 'D', idx: 1 }, { face: 'F', idx: 7 }],
+    DL: [{ face: 'D', idx: 3 }, { face: 'L', idx: 7 }],
+    DB: [{ face: 'D', idx: 7 }, { face: 'B', idx: 7 }],
+    FR: [{ face: 'F', idx: 5 }, { face: 'R', idx: 3 }],
+    FL: [{ face: 'F', idx: 3 }, { face: 'L', idx: 5 }],
+    BL: [{ face: 'B', idx: 5 }, { face: 'L', idx: 3 }],
+    BR: [{ face: 'B', idx: 3 }, { face: 'R', idx: 5 }]
+  };
+
+  function addLog(message, className = 'info') {
+    const line = document.createElement('div');
+    line.className = className;
+    const time = new Date().toLocaleTimeString();
+    line.innerHTML = '[' + time + '] ' + message;
+    logDiv.appendChild(line);
+    while (logDiv.childElementCount > 200) logDiv.removeChild(logDiv.firstChild);
+    logDiv.scrollTop = logDiv.scrollHeight;
+  }
+
+  // 3. Permutation Helpers (Applies physical face moves to physical facelets)
+  function rotateFaceCW(arr, offset) {
+    const temp = arr[offset + 0];
+    arr[offset + 0] = arr[offset + 6];
+    arr[offset + 6] = arr[offset + 8];
+    arr[offset + 8] = arr[offset + 2];
+    arr[offset + 2] = temp;
+
+    const tempEdge = arr[offset + 1];
+    arr[offset + 1] = arr[offset + 3];
+    arr[offset + 3] = arr[offset + 7];
+    arr[offset + 7] = arr[offset + 5];
+    arr[offset + 5] = tempEdge;
+  }
+
+  function cycle(arr, i1, i2, i3, i4) {
+    const temp = arr[i4];
+    arr[i4] = arr[i3];
+    arr[i3] = arr[i2];
+    arr[i2] = arr[i1];
+    arr[i1] = temp;
+  }
+
+  function applyBaseMove(arr, face) {
+    if (face === 'U') {
+      rotateFaceCW(arr, 0);
+      cycle(arr, 45, 9, 18, 36);
+      cycle(arr, 46, 10, 19, 37);
+      cycle(arr, 47, 11, 20, 38);
+    } else if (face === 'D') {
+      rotateFaceCW(arr, 27);
+      cycle(arr, 24, 15, 51, 42);
+      cycle(arr, 25, 16, 52, 43);
+      cycle(arr, 26, 17, 53, 44);
+    } else if (face === 'R') {
+      rotateFaceCW(arr, 9);
+      cycle(arr, 2, 45, 29, 20);
+      cycle(arr, 5, 48, 32, 23);
+      cycle(arr, 8, 51, 35, 26);
+    } else if (face === 'L') {
+      rotateFaceCW(arr, 36);
+      cycle(arr, 0, 18, 27, 53);
+      cycle(arr, 3, 21, 30, 50);
+      cycle(arr, 6, 24, 33, 47);
+    } else if (face === 'F') {
+      rotateFaceCW(arr, 18);
+      cycle(arr, 6, 9, 29, 44);
+      cycle(arr, 7, 12, 28, 41);
+      cycle(arr, 8, 15, 27, 38);
+    } else if (face === 'B') {
+      rotateFaceCW(arr, 45);
+      cycle(arr, 2, 36, 33, 17);
+      cycle(arr, 1, 39, 34, 14);
+      cycle(arr, 0, 42, 35, 11);
+    }
+  }
+
+  function applyMoveToFacelets(facelets, move) {
+    const face = move[0];
+    const modifier = move.slice(1);
+    let arr = facelets.split('');
+
+    let turns = 1;
+    if (modifier === "'") turns = 3;
+    if (modifier === '2') turns = 2;
+
+    for (let t = 0; t < turns; t++) {
+      applyBaseMove(arr, face);
+    }
+    return arr.join('');
+  }
+
+  // 4. UI & Rendering Functions
+  function initCubeDOM() {
+    const faces = document.querySelectorAll('.face3d, .net-face');
+    faces.forEach(face => {
+      face.innerHTML = '';
+      for (let i = 0; i < 9; i++) {
+        const sticker = document.createElement('div');
+        sticker.className = 'sticker';
+        face.appendChild(sticker);
+      }
+    });
+  }
+
+  function updateCubeVisuals(facelets, badEdgeNames = []) {
+    if (!facelets || facelets.length < 54) return;
+    document.querySelectorAll('.sticker').forEach(el => el.classList.remove('bad-glow'));
+
+    FACE_ORDER.forEach((faceChar, faceIndex) => {
+      const faceOffset = faceIndex * 9;
+      const target3d = document.querySelector(`.face3d.${faceChar}`);
+      const targetNet = document.querySelector(`.net-face.${faceChar}`);
+
+      for (let i = 0; i < 9; i++) {
+        const colorChar = facelets[faceOffset + i];
+        const colorClass = `color-${colorChar}`;
+
+        if (target3d && target3d.children[i]) target3d.children[i].className = `sticker ${colorClass}`;
+        if (targetNet && targetNet.children[i]) targetNet.children[i].className = `sticker ${colorClass}`;
+      }
+    });
+
+    badEdgeNames.forEach(edgeName => {
+      const stickers = EDGE_STICKER_MAP[edgeName];
+      if (!stickers) return;
+      stickers.forEach(s => {
+        const t3d = document.querySelector(`.face3d.${s.face}`)?.children[s.idx];
+        const tNet = document.querySelector(`.net-face.${s.face}`)?.children[s.idx];
+        if (t3d) t3d.classList.add('bad-glow');
+        if (tNet) tNet.classList.add('bad-glow');
+      });
+    });
+  }
+
+  function updateGyroOrientation(q) {
+    if (!q) return;
+    const { x, y, z, w } = q;
+    const roll = Math.atan2(2 * (w * x + y * z), 1 - 2 * (x * x + y * y));
+    const pitch = Math.asin(Math.max(-1, Math.min(1, 2 * (w * y - z * x))));
+    const yaw = Math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z));
+    const deg = 180 / Math.PI;
+
+    currentRawEuler = { pitch: pitch * deg, yaw: yaw * deg, roll: roll * deg };
+
+    const p = currentRawEuler.pitch - gyroBaseline.pitch - 25;
+    const yA = currentRawEuler.yaw - gyroBaseline.yaw + 45;
+    const r = currentRawEuler.roll - gyroBaseline.roll;
+
+    cube3D.style.transform = `rotateX(${p}deg) rotateY(${yA}deg) rotateZ(${r}deg)`;
+  }
+
+  function processCubeState(facelets) {
+    // Dynamically derive reference centers based on active orientation
+    const centers = {
+      U: facelets[4],
+      R: facelets[13],
+      F: facelets[22],
+      D: facelets[31],
+      L: facelets[40],
+      B: facelets[49]
+    };
+
+    const axis = axisSelect.value;
+    let primaryFaces, primaryColors, fallbackFaces, fallbackColors;
+
+    if (axis === 'FB') {
+      primaryFaces = ['F', 'B'];
+      primaryColors = [centers.F, centers.B];
+      fallbackFaces = ['U', 'D'];
+      fallbackColors = [centers.U, centers.D];
+    } else if (axis === 'UD') {
+      primaryFaces = ['U', 'D'];
+      primaryColors = [centers.U, centers.D];
+      fallbackFaces = ['F', 'B'];
+      fallbackColors = [centers.F, centers.B];
+    } else {
+      primaryFaces = ['R', 'L'];
+      primaryColors = [centers.R, centers.L];
+      fallbackFaces = ['U', 'D'];
+      fallbackColors = [centers.U, centers.D];
+    }
+
+    const results = EDGES.map(edge => {
+      const c0 = facelets[edge.idx[0]];
+      const c1 = facelets[edge.idx[1]];
+      const f0 = edge.faces[0];
+      const f1 = edge.faces[1];
+
+      let isGood = false;
+
+      if (primaryColors.includes(c0)) {
+        if (primaryFaces.includes(f0)) {
+          isGood = true;
+        } else if (fallbackFaces.includes(f0) && !primaryFaces.includes(f1) && !fallbackFaces.includes(f1)) {
+          isGood = true;
+        }
+      } else if (primaryColors.includes(c1)) {
+        if (primaryFaces.includes(f1)) {
+          isGood = true;
+        } else if (fallbackFaces.includes(f1) && !primaryFaces.includes(f0) && !fallbackFaces.includes(f0)) {
+          isGood = true;
+        }
+      } else if (fallbackColors.includes(c0)) {
+        if (fallbackFaces.includes(f0)) isGood = true;
+      } else if (fallbackColors.includes(c1)) {
+        if (fallbackFaces.includes(f1)) isGood = true;
+      }
+
+      return { position: edge.name, good: isGood };
+    });
+
+    edgeGrid.innerHTML = '';
+    let badCount = 0;
+    const badEdgeNames = [];
+
+    for (const r of results) {
+      const cell = document.createElement('div');
+      cell.className = 'cell ' + (r.good ? 'good' : 'bad');
+      cell.textContent = r.position;
+      if (!r.good) {
+        badCount++;
+        badEdgeNames.push(r.position);
+      }
+      edgeGrid.appendChild(cell);
+    }
+
+    if (badCount === 0) {
+      summaryDiv.className = 'summary allgood';
+      summaryDiv.textContent = 'EO SOLVED — 12/12 good';
+    } else {
+      summaryDiv.className = 'summary hasbad';
+      summaryDiv.textContent = `${badCount} bad edge${badCount === 1 ? '' : 's'} — ${12 - badCount}/12 good`;
+    }
+
+    updateCubeVisuals(facelets, badEdgeNames);
+  }
+
+  function applyColorScheme() {
+    localStorage.setItem('eo_color_scheme', colorSchemeSelect.value);
+    currentFacelets = getSolvedFacelets();
+    processCubeState(currentFacelets);
+    addLog(`Orientation set to ${colorSchemeSelect.options[colorSchemeSelect.selectedIndex].text}`, 'info');
+  }
+
+  // 5. Event Listener Attachments
+  const savedAxis = localStorage.getItem('eo_axis_pref');
+  if (savedAxis) axisSelect.value = savedAxis;
+  axisSelect.addEventListener('change', () => {
+    localStorage.setItem('eo_axis_pref', axisSelect.value);
+    processCubeState(currentFacelets);
+  });
+
+  const savedScheme = localStorage.getItem('eo_color_scheme');
+  if (savedScheme && COLOR_SCHEMES[savedScheme]) {
+    colorSchemeSelect.value = savedScheme;
+  }
+  colorSchemeSelect.addEventListener('change', applyColorScheme);
+
+  resetGyroBtn.addEventListener('click', () => {
+    gyroBaseline = { ...currentRawEuler };
+    addLog('Gyro orientation reset.', 'info');
+  });
+
+  resetStateBtn.addEventListener('click', () => {
+    currentFacelets = getSolvedFacelets();
+    processCubeState(currentFacelets);
+    addLog('Virtual state reset to SOLVED.', 'info');
+  });
+
+  connectBtn.addEventListener('click', async () => {
+    const mac = macInput.value.trim();
+    if (!mac) { addLog('Enter a MAC address first.', 'error'); return; }
+    try {
+      addLog('Connecting...');
+      conn = await connectGanCube(async () => mac);
+      addLog('Connected to: ' + conn.deviceName, 'info');
+      connStatus.textContent = 'Connected: ' + conn.deviceName;
+      connectBtn.disabled = true;
+      disconnectBtn.disabled = false;
+
+      conn.events$.subscribe({
+        next: (event) => {
+          if (event.type === 'MOVE') {
+            addLog('Move: <span class="move">' + event.move + '</span>');
+            currentFacelets = applyMoveToFacelets(currentFacelets, event.move);
+            processCubeState(currentFacelets);
+          } else if (event.type === 'GYRO' || event.type === 'ORIENTATION') {
+            if (event.quaternion) updateGyroOrientation(event.quaternion);
+          } else if (event.type === 'BATTERY') {
+            battStatus.textContent = 'Battery: ' + event.batteryLevel + '%';
+          } else if (event.type === 'DISCONNECT') {
+            addLog('Cube disconnected', 'error');
+            connStatus.textContent = 'Disconnected.';
+            connectBtn.disabled = false;
+            disconnectBtn.disabled = true;
+            conn = null;
+          }
+        },
+        error: (err) => addLog('Stream error: ' + err, 'error')
+      });
+
+    } catch (err) {
+      addLog('Connection failed: ' + (err.message || err), 'error');
+      connStatus.textContent = 'Connection failed.';
+    }
+  });
+
+  disconnectBtn.addEventListener('click', async () => {
+    if (conn) {
+      try { await conn.disconnect(); } catch (e) {}
+      conn = null;
+    }
+    connStatus.textContent = 'Disconnected.';
+    connectBtn.disabled = false;
+    disconnectBtn.disabled = true;
+  });
+
+  // 6. Safe Initialization
+  initCubeDOM();
+  currentFacelets = getSolvedFacelets();
+  processCubeState(currentFacelets);
+</script>
+</body>
+</html>
