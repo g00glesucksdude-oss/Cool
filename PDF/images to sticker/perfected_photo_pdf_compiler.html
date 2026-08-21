@@ -1,0 +1,1519 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Photo PDF Compiler</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #121212; color: #e0e0e0; padding: 15px; margin: 0; }
+  .card { background: #1e1e1e; padding: 16px; border-radius: 12px; margin-bottom: 15px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }
+  h2 { margin: 0 0 10px 0; color: #ff9500; font-size: 19px; }
+  .sub { font-size: 12px; color: #888; margin: -4px 0 12px 0; }
+  .flex-grid { display: flex; gap: 10px; margin-bottom: 10px; }
+  .input-box { width: 100%; padding: 10px; background: #2a2a2a; border: 1px solid #444; border-radius: 6px; color: white; font-size: 14px; }
+  label { display: block; font-size: 13px; margin-bottom: 4px; color: #aaa; }
+  .check-line { display: flex; align-items: center; gap: 8px; font-size: 13px; color: #ddd; margin: 10px 0; }
+  .check-line input[type="checkbox"] { width: 17px; height: 17px; accent-color: #ff9500; }
+  .btn { display: block; width: 100%; padding: 12px; background: #ff9500; color: black; border: none; border-radius: 8px; font-size: 15px; font-weight: bold; margin-top: 8px; text-align: center; cursor: pointer; }
+  .btn:disabled { opacity: 0.35; cursor: default; }
+  .btn-sec { background: #383838; color: #eee; }
+  .btn-go { background: #34c759; }
+  input[type="file"] { display: none; }
+  .drop-zone { border: 2px dashed #444; border-radius: 10px; padding: 24px 12px; text-align: center; color: #888; font-size: 14px; cursor: pointer; }
+  .drop-zone.drag { border-color: #ff9500; color: #ff9500; }
+  .thumbs { display: grid; grid-template-columns: repeat(auto-fill, minmax(64px, 1fr)); gap: 6px; max-height: 220px; overflow-y: auto; margin-top: 12px; }
+  .thumb { position: relative; aspect-ratio: 1; border-radius: 6px; overflow: hidden; background: #2a2a2a; cursor: pointer; border: 2px solid transparent; }
+  .thumb.active { border-color: #ff9500; }
+  .thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .thumb .idx { position: absolute; bottom: 2px; right: 4px; font-size: 9px; color: #fff; background: rgba(0,0,0,0.6); border-radius: 3px; padding: 0 3px; }
+  .thumb .badges { position: absolute; top: 2px; left: 2px; font-size: 10px; }
+  .thumb .badges span { background: rgba(0,0,0,0.65); border-radius: 3px; padding: 0 2px; }
+  .count-line { font-size: 13px; color: #ccc; margin-top: 10px; }
+  .status { font-size: 13px; margin-top: 10px; min-height: 18px; white-space: pre-line; }
+  .status.error { color: #ff453a; }
+  .status.done { color: #34c759; }
+  .status.running { color: #ffd60a; }
+  .status.warn { color: #ff9500; }
+  .progress-bar-outer { background: #2a2a2a; border-radius: 6px; height: 8px; margin-top: 8px; overflow: hidden; display: none; }
+  .progress-bar-inner { background: #ff9500; height: 100%; width: 0%; transition: width .2s; }
+  .page-previews { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 12px; }
+  .page-preview-wrap { position: relative; }
+  .page-preview-wrap canvas { height: 200px; border-radius: 6px; border: 1px solid #333; cursor: pointer; display: block; }
+  .page-preview-wrap .page-num { position: absolute; bottom: 4px; left: 4px; font-size: 10px; color: #fff; background: rgba(0,0,0,0.6); border-radius: 3px; padding: 0 4px; }
+  .note { font-size: 12px; color: #777; margin-top: 10px; line-height: 1.5; }
+  .panel { background: #262115; border: 1px solid #ff9500; border-radius: 10px; padding: 12px; margin-top: 12px; display: none; }
+  .panel.open { display: block; }
+  .panel-title { font-size: 13px; font-weight: bold; color: #ff9500; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; }
+  .panel-title button { background: none; border: none; color: #888; font-size: 16px; cursor: pointer; padding: 0 4px; }
+  .panel .sub-row { display: flex; gap: 8px; align-items: center; margin-top: 6px; }
+  .panel .sub-row label { margin: 0; white-space: nowrap; }
+  .panel .grp { padding: 8px; background: #1e1e1e; border-radius: 8px; margin-top: 8px; }
+  input[type="range"] { accent-color: #ff9500; height: 20px; }
+  .text-preview { background: #101010; border: 1px solid #333; border-radius: 6px; padding: 8px 10px; margin-top: 6px; overflow: hidden; white-space: nowrap; color: #fff; font-family: Georgia, serif; line-height: 1.1; }
+  .priority-strip { display: flex; gap: 4px; flex-wrap: wrap; font-size: 11px; color: #999; margin: 8px 0 4px 0; }
+  .priority-strip span { background: #2a2a2a; border-radius: 4px; padding: 2px 7px; }
+  .priority-strip span b { color: #ff9500; }
+  .edit-popover { position: fixed; left: 10px; right: 10px; bottom: 10px; z-index: 50; background: #1e1e1e; border: 2px solid #ff9500; border-radius: 12px; padding: 14px; box-shadow: 0 6px 20px rgba(0,0,0,0.5); display: none; max-width: 480px; margin: 0 auto; }
+  .edit-popover.open { display: block; }
+  .edit-popover .title { font-weight: bold; color: #ff9500; margin-bottom: 6px; font-size: 14px; }
+  .edit-popover .cur { font-size: 12px; color: #999; margin-bottom: 8px; }
+  .issue-nav { background: #2a1414; border: 1px solid #ff453a; border-radius: 10px; padding: 10px; margin-top: 10px; }
+  .issue-nav-info { font-size: 13px; color: #ffb4b0; line-height: 1.4; }
+  .issue-marker { position: absolute; border: 2px solid #ff453a; background: rgba(255,69,58,0.18); border-radius: 4px; pointer-events: none; }
+  .issue-marker.current { border-color: #ffd60a; background: rgba(255,214,10,0.28); border-width: 3px; }
+</style>
+</head>
+<body>
+
+  <div class="card">
+    <h2>1. Add Photos</h2>
+    <div class="sub">Runs entirely in this browser tab — nothing is uploaded anywhere.</div>
+    <div class="drop-zone" id="drop-zone">Tap to choose photos, or drag &amp; drop them here</div>
+    <input type="file" id="file-input" accept="image/*" multiple>
+    <div class="flex-grid" style="margin-top:10px;">
+      <button class="btn btn-sec" style="margin:0;" onclick="document.getElementById('file-input').click()">🖼️ Choose Photos</button>
+      <button class="btn btn-sec" style="margin:0;" id="clear-btn">🗑️ Clear</button>
+    </div>
+    <div class="count-line" id="count-line"></div>
+    <div class="thumbs" id="thumbs"></div>
+    <div class="note">Tap a photo to give it an exact print size. After compiling, tap any photo in a page preview to pin its size by hand — neighbors reflow around it. Badge: 📏 = exact size set.</div>
+
+    <div class="panel" id="photo-panel">
+      <div class="panel-title"><span id="panel-name">Photo settings</span><button id="panel-close">✕</button></div>
+      <div class="grp">
+        <div class="check-line"><input type="checkbox" id="p-fixed-on"><label for="p-fixed-on" style="margin:0;">Print at an exact size</label></div>
+        <div class="sub-row">
+          <select id="p-fixed-axis" class="input-box" style="width:120px;">
+            <option value="w">Exact width</option>
+            <option value="h">Exact height</option>
+          </select>
+          <input type="number" id="p-fixed-value" class="input-box" style="width:90px;" value="4" min="0" step="0.1">
+          <select id="p-fixed-unit" class="input-box" style="width:90px;">
+            <option value="in">inches</option>
+            <option value="cm">cm</option>
+            <option value="mm">mm</option>
+            <option value="pct">% of page</option>
+          </select>
+        </div>
+        <div class="sub-row" id="p-fixed-pct-row" style="display:none; margin-top:8px;">
+          <input type="range" id="p-fixed-pct-slider" min="1" max="100" step="1" value="25" style="flex:1;">
+        </div>
+        <div class="sub" style="margin-top:6px;">The other dimension scales automatically. Width and height each remember their own value — and each remembers its own unit, so switching to "% of page" only affects the dimension you're currently editing. This photo gets its own full-width row, exempt from size limits and split — unless OCR override is on and its text can't be made readable at this size.</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>2. Configure</h2>
+    <div class="sub">These apply to every photo that isn't locked to an exact size. Order when settings conflict: exact size &gt; OCR/size-range readability &gt; split — <b>except</b> readability can override exact size when its toggle below is on, and anything you manually pin in a page preview always wins over all of this.</div>
+    <div class="priority-strip">
+      <span><b>0</b> Manual pin</span><span><b>1</b> Exact size</span><span><b>2</b> OCR / size range</span><span><b>3</b> Split</span>
+    </div>
+    <div class="flex-grid">
+      <div style="flex:1;">
+        <label>Images / Page (target)</label>
+        <input type="number" id="base_count" class="input-box" value="16" min="1">
+      </div>
+      <div style="flex:1;">
+        <label>Max Squeeze (overflow)</label>
+        <input type="number" id="threshold" class="input-box" value="4" min="0">
+      </div>
+    </div>
+
+    <div style="margin-top:14px;">
+      <label>Overall photo size: <span id="global-size-readout">0%</span></label>
+      <input type="range" id="global-size-slider" min="-100" max="100" step="1" value="0" style="width:100%;">
+      <div class="sub-row">
+        <label for="global-size-input" style="white-space:nowrap;">Exact %</label>
+        <input type="number" id="global-size-input" class="input-box" value="0" step="1" style="width:90px;">
+        <span class="sub" style="margin:0;">Slider covers -100% to +100% — type past that for bigger changes.</span>
+      </div>
+      <div class="note" style="margin-top:2px;">Scales every photo — including exact-size and readability-boosted ones — by this percent. 0% = unchanged, +100% = double size (roughly half as many fit per page), -100% would shrink to nothing so it's floored at -95%. Doesn't touch the size-range restriction below — if that's on and its minimum is bigger than what a negative % implies, the restriction still wins.</div>
+    </div>
+    <div class="note" style="margin-top:-6px;">This target is only guaranteed among freely-packed photos. A photo pinned to an exact size, boosted by OCR for readability, or capped by the size range below gets its own dedicated row sized to that requirement — if a lot of your photos trigger one of those, fewer will fit per page, since dedicated rows don't share space. That's the tradeoff those features exist for, not a bug.</div>
+
+    <div class="check-line">
+      <input type="checkbox" id="sizecap-on">
+      <label for="sizecap-on" style="margin:0;">Restrict every photo's print size to a range (long edge)</label>
+    </div>
+    <div class="panel" id="sizecap-panel">
+      <div class="grp">
+        <div class="sub-row">
+          <label style="width:36px;">Min</label>
+          <input type="number" id="sizecap-min-value" class="input-box" style="width:80px;" value="3" min="0" step="0.1">
+          <select id="sizecap-min-unit" class="input-box" style="width:80px;">
+            <option value="in">in</option><option value="cm">cm</option><option value="mm">mm</option>
+          </select>
+        </div>
+        <div class="sub-row">
+          <label style="width:36px;">Max</label>
+          <input type="number" id="sizecap-max-value" class="input-box" style="width:80px;" value="8" min="0" step="0.1">
+          <select id="sizecap-max-unit" class="input-box" style="width:80px;">
+            <option value="in">in</option><option value="cm">cm</option><option value="mm">mm</option>
+          </select>
+        </div>
+        <div class="note">Applies to every freely auto-packed photo's longer side. Exact-size photos are exempt. If this conflicts with the OCR readability minimum, staying readable wins.</div>
+      </div>
+    </div>
+
+    <div class="check-line">
+      <input type="checkbox" id="ocr-on">
+      <label for="ocr-on" style="margin:0;">Scan photos for text (OCR) and resize so it stays readable</label>
+    </div>
+    <div class="panel" id="ocr-options-panel">
+      <div class="grp">
+        <label>Minimum text height — anything smaller gets enlarged</label>
+        <div class="sub-row">
+          <input type="range" id="ocr-min-px" min="8" max="120" step="1" value="28" style="flex:1;">
+          <span class="sub" id="ocr-min-readout" style="margin:0; width:92px; text-align:right;"></span>
+        </div>
+        <div class="text-preview"><span id="ocr-min-sample">Ag Sample</span></div>
+      </div>
+      <div class="grp">
+        <label>Maximum text height — anything bigger gets shrunk to fit more photos in</label>
+        <div class="sub-row">
+          <input type="range" id="ocr-max-px" min="40" max="400" step="1" value="160" style="flex:1;">
+          <span class="sub" id="ocr-max-readout" style="margin:0; width:92px; text-align:right;"></span>
+        </div>
+        <div class="text-preview"><span id="ocr-max-sample">Ag Sample</span></div>
+      </div>
+      <div class="check-line">
+        <input type="checkbox" id="ocr-override-exact" checked>
+        <label for="ocr-override-exact" style="margin:0;">Let text readability override an exact size if it conflicts</label>
+      </div>
+      <div class="sub-row">
+        <label for="ocr-lang" style="white-space:nowrap;">Language</label>
+        <select id="ocr-lang" class="input-box">
+          <option value="eng" selected>English</option>
+        </select>
+      </div>
+      <button class="btn btn-sec" id="clear-ocr-cache-btn" type="button" style="margin-top:10px;">🧹 Clear saved OCR scans</button>
+      <div class="note" id="ocr-cache-note" style="margin-top:4px;"></div>
+      <div class="note" style="margin-top:8px;">Scans 3 photos at once (worker pool) and skips full-page layout analysis in favor of a faster scattered-text mode, since a photo is closer to "labels here and there" than a printed page. Ignores speck-sized detections, needs at least 3 confident text detections before trusting them, and looks at the typical (not literal min/max) word size, so one stray misread can't force a runaway resize. If a photo genuinely needs enlarging to stay readable, it may get turned 90° first (never mirrored) if that lets it fit using less page height — and one photo's boost is always capped well under a full page, so your images-per-page target can't collapse to just one or two photos. Cached per photo in this browser, so recompiling or resuming after an interruption reuses scans instead of redoing them. If a photo's small text isn't important to you, just pin its size manually in the page preview after compiling — a manual pin always wins.</div>
+    </div>
+
+    <div class="check-line">
+      <input type="checkbox" id="split-on">
+      <label for="split-on" style="margin:0;">Split a photo across pages to use 100% of leftover paper</label>
+    </div>
+    <div class="note" style="margin-top:-6px;">Last resort: when a page has leftover blank space no whole photo fits into, slices the next eligible photo with a straight cut — one piece fills the gap, the rest carries to the next page — so the pieces can be cut and taped back together. Skips exact-size photos and anything with detected text.</div>
+  </div>
+
+  <div class="card">
+    <h2>3. Compile</h2>
+    <button class="btn btn-go" id="compile-btn" disabled>🚀 COMPILE OPTIMIZED PDF</button>
+    <button class="btn btn-sec" id="export-btn" style="display:none;">📥 Export PDF (with your edits)</button>
+    <button class="btn btn-sec" id="check-readability-btn" style="display:none;">🔍 Check Readability</button>
+    <div class="progress-bar-outer" id="progress-outer"><div class="progress-bar-inner" id="progress-inner"></div></div>
+    <div class="status" id="status-line"></div>
+    <div class="issue-nav" id="issue-nav" style="display:none;">
+      <div class="issue-nav-info" id="issue-nav-info"></div>
+      <div class="flex-grid" style="margin:8px 0 0 0;">
+        <button class="btn btn-sec" id="issue-prev-btn" style="margin:0;">◀ Prev</button>
+        <button class="btn btn-sec" id="issue-next-btn" style="margin:0;">Next ▶</button>
+        <button class="btn btn-sec" id="issue-close-btn" style="margin:0;">✕ Close</button>
+      </div>
+    </div>
+    <div class="page-previews" id="page-previews"></div>
+    <div class="note">Tap any photo in a preview above to pin its size and re-flow its neighbors, then "Export PDF" to download the updated result. "Check Readability" re-checks text against the sizes photos are <i>actually</i> printing at right now (after any resizing you've done) and highlights anything that's gotten too small — use ◀ ▶ or the arrow keys to step through flagged photos. Photos are decoded and released one at a time (or one page at a time) rather than all held in memory together.</div>
+  </div>
+
+  <div class="edit-popover" id="edit-popover">
+    <div class="title" id="edit-popover-name">Photo</div>
+    <div class="cur" id="edit-popover-cur"></div>
+    <div class="flex-grid">
+      <select id="edit-axis" class="input-box" style="flex:1;">
+        <option value="w">Set width</option>
+        <option value="h">Set height</option>
+      </select>
+      <input type="number" id="edit-value" class="input-box" style="flex:1;" value="4" min="0.1" step="0.1">
+      <select id="edit-unit" class="input-box" style="flex:1;">
+        <option value="in">in</option><option value="cm">cm</option><option value="mm">mm</option><option value="pct">% of page</option>
+      </select>
+    </div>
+    <div class="sub-row" id="edit-pct-row" style="display:none; margin-top:8px;">
+      <input type="range" id="edit-pct-slider" min="1" max="100" step="1" value="25" style="flex:1;">
+    </div>
+    <div class="flex-grid" style="margin-top:8px;">
+      <button class="btn" id="edit-pin-btn" style="margin:0;">📌 Pin & Re-layout</button>
+      <button class="btn btn-sec" id="edit-unpin-btn" style="margin:0;">Unpin</button>
+    </div>
+    <button class="btn btn-sec" id="edit-close-btn">Close</button>
+  </div>
+
+<script>
+const PAGE_W = 2480, PAGE_H = 3508; // A4 @ 300dpi
+const DPI = 300;
+const SPLIT_MIN_GAP_PX = 60;
+const RENDER_CAP_PX = 3600; // no photo decoded larger than this on its long edge
+const OCR_CACHE_PREFIX = 'photopdf_ocr_v4:';
+const OCR_MAX_UPSCALE = 3; // lowered from 6 — a single photo shouldn't be allowed to balloon 6x
+const OCR_MAX_PAGE_FRACTION = 0.55; // hard ceiling: one photo's readability boost can never claim more than this share of a page
+const OCR_POOL_SIZE = 3;
+const OCR_ZOOM_TARGET = 2200; // smaller than before — faster, still enough to catch small text
+let selectedFiles = [];
+let activeIndex = -1;
+
+const dropZone = document.getElementById('drop-zone');
+const fileInput = document.getElementById('file-input');
+const thumbsEl = document.getElementById('thumbs');
+const countLine = document.getElementById('count-line');
+const compileBtn = document.getElementById('compile-btn');
+const exportBtn = document.getElementById('export-btn');
+const statusLine = document.getElementById('status-line');
+const progressOuter = document.getElementById('progress-outer');
+const progressInner = document.getElementById('progress-inner');
+const pagePreviews = document.getElementById('page-previews');
+
+const panel = document.getElementById('photo-panel');
+const panelName = document.getElementById('panel-name');
+const pFixedPctRow = document.getElementById('p-fixed-pct-row');
+const pFixedPctSlider = document.getElementById('p-fixed-pct-slider');
+const pFixedOn = document.getElementById('p-fixed-on');
+const pFixedValue = document.getElementById('p-fixed-value');
+const pFixedUnit = document.getElementById('p-fixed-unit');
+const pFixedAxis = document.getElementById('p-fixed-axis');
+
+const splitOn = document.getElementById('split-on');
+
+const globalSizeSlider = document.getElementById('global-size-slider');
+const globalSizeInput = document.getElementById('global-size-input');
+const globalSizeReadout = document.getElementById('global-size-readout');
+function syncGlobalSizeFromSlider() {
+  globalSizeInput.value = globalSizeSlider.value;
+  globalSizeReadout.textContent = `${globalSizeSlider.value}%`;
+}
+function syncGlobalSizeFromInput() {
+  const v = parseFloat(globalSizeInput.value);
+  const safe = isFinite(v) ? v : 0;
+  globalSizeReadout.textContent = `${safe}%`;
+  globalSizeSlider.value = Math.max(-100, Math.min(100, safe)); // slider just clamps visually; the typed value is what's actually used
+}
+globalSizeSlider.addEventListener('input', syncGlobalSizeFromSlider);
+globalSizeInput.addEventListener('input', syncGlobalSizeFromInput);
+
+// Scales every item's already-computed constraint height (exact-size or
+// OCR-driven) from its snapshotted base value — never compounds on a
+// previous scale — and leaves anything the user has manually pinned alone,
+// since a manual pin is meant to always win outright.
+function applyGlobalSizeMultiplier(items, multiplier) {
+  for (const it of items) {
+    if (it.manualPin) continue;
+    it.constraintHeightPx = it.baseConstraintHeightPx ? Math.min(it.baseConstraintHeightPx * multiplier, PAGE_H) : it.baseConstraintHeightPx || null;
+    it.maxConstraintHeightPx = it.baseMaxConstraintHeightPx ? Math.min(it.baseMaxConstraintHeightPx * multiplier, PAGE_H) : it.baseMaxConstraintHeightPx || null;
+  }
+}
+
+// Re-running the whole compile (including OCR) just to preview a size change
+// would be slow and pointless — the base constraint values are already
+// known, so this just rescales them and re-paginates/re-renders, and you see
+// the new page count immediately.
+async function applyGlobalSizeRelayout() {
+  if (!liveItems.length) return;
+  const target = Math.max(1, parseInt(document.getElementById('base_count').value, 10) || 16);
+  const overflow = Math.max(0, parseInt(document.getElementById('threshold').value, 10) || 0);
+  const v = parseFloat(globalSizeInput.value);
+  const globalSizePercent = isFinite(v) ? v : 0;
+  const sizeMultiplier = Math.max(0.05, 1 + globalSizePercent / 100);
+  const effectiveTarget = Math.max(1, Math.round(target / sizeMultiplier));
+
+  applyGlobalSizeMultiplier(liveItems, sizeMultiplier);
+  liveConfig = { target: effectiveTarget, overflow };
+  await relayoutAndRerender();
+}
+globalSizeSlider.addEventListener('change', applyGlobalSizeRelayout);
+globalSizeInput.addEventListener('change', applyGlobalSizeRelayout);
+
+const sizecapOn = document.getElementById('sizecap-on');
+const sizecapPanel = document.getElementById('sizecap-panel');
+const sizecapMinValue = document.getElementById('sizecap-min-value');
+const sizecapMinUnit = document.getElementById('sizecap-min-unit');
+const sizecapMaxValue = document.getElementById('sizecap-max-value');
+const sizecapMaxUnit = document.getElementById('sizecap-max-unit');
+sizecapOn.addEventListener('change', () => sizecapPanel.classList.toggle('open', sizecapOn.checked));
+
+const ocrOn = document.getElementById('ocr-on');
+const ocrOptionsPanel = document.getElementById('ocr-options-panel');
+const ocrMinPx = document.getElementById('ocr-min-px');
+const ocrMaxPx = document.getElementById('ocr-max-px');
+const ocrMinReadout = document.getElementById('ocr-min-readout');
+const ocrMaxReadout = document.getElementById('ocr-max-readout');
+const ocrMinSample = document.getElementById('ocr-min-sample');
+const ocrMaxSample = document.getElementById('ocr-max-sample');
+const ocrCacheNote = document.getElementById('ocr-cache-note');
+const ocrOverrideExact = document.getElementById('ocr-override-exact');
+
+const editPopover = document.getElementById('edit-popover');
+const editPopoverName = document.getElementById('edit-popover-name');
+const editPopoverCur = document.getElementById('edit-popover-cur');
+const editAxis = document.getElementById('edit-axis');
+const editValue = document.getElementById('edit-value');
+const editUnit = document.getElementById('edit-unit');
+const editPinBtn = document.getElementById('edit-pin-btn');
+const editUnpinBtn = document.getElementById('edit-unpin-btn');
+const editPctRow = document.getElementById('edit-pct-row');
+const editPctSlider = document.getElementById('edit-pct-slider');
+document.getElementById('edit-close-btn').addEventListener('click', () => editPopover.classList.remove('open'));
+
+const checkReadabilityBtn = document.getElementById('check-readability-btn');
+const issueNav = document.getElementById('issue-nav');
+const issueNavInfo = document.getElementById('issue-nav-info');
+const issuePrevBtn = document.getElementById('issue-prev-btn');
+const issueNextBtn = document.getElementById('issue-next-btn');
+const issueCloseBtn = document.getElementById('issue-close-btn');
+
+function pxToMm(px) { return (px / DPI * 25.4).toFixed(1); }
+function pxToCssFont(px) { return Math.max(6, px * 96 / DPI); }
+
+function updateOcrPreview() {
+  const minPx = parseFloat(ocrMinPx.value) || 8;
+  const maxPx = parseFloat(ocrMaxPx.value) || minPx;
+  ocrMinReadout.textContent = `${minPx}px / ${pxToMm(minPx)}mm`;
+  ocrMaxReadout.textContent = `${maxPx}px / ${pxToMm(maxPx)}mm`;
+  ocrMinSample.style.fontSize = pxToCssFont(minPx) + 'px';
+  ocrMaxSample.style.fontSize = pxToCssFont(Math.min(maxPx, 420)) + 'px';
+}
+ocrOn.addEventListener('change', () => ocrOptionsPanel.classList.toggle('open', ocrOn.checked));
+[ocrMinPx, ocrMaxPx].forEach(el => el.addEventListener('input', updateOcrPreview));
+updateOcrPreview();
+
+function countOcrCacheEntries() {
+  let n = 0;
+  try { for (let i = 0; i < localStorage.length; i++) if (localStorage.key(i).startsWith(OCR_CACHE_PREFIX)) n++; } catch (e) {}
+  return n;
+}
+function refreshOcrCacheNote() {
+  const n = countOcrCacheEntries();
+  ocrCacheNote.textContent = n ? `${n} scan(s) saved in this browser.` : 'No saved scans yet.';
+}
+document.getElementById('clear-ocr-cache-btn').addEventListener('click', () => {
+  try {
+    const keys = [];
+    for (let i = 0; i < localStorage.length; i++) { const k = localStorage.key(i); if (k.startsWith(OCR_CACHE_PREFIX)) keys.push(k); }
+    keys.forEach(k => localStorage.removeItem(k));
+  } catch (e) {}
+  refreshOcrCacheNote();
+});
+refreshOcrCacheNote();
+
+dropZone.addEventListener('click', () => fileInput.click());
+['dragover','dragenter'].forEach(evt => dropZone.addEventListener(evt, e => { e.preventDefault(); dropZone.classList.add('drag'); }));
+['dragleave','drop'].forEach(evt => dropZone.addEventListener(evt, e => { e.preventDefault(); dropZone.classList.remove('drag'); }));
+dropZone.addEventListener('drop', e => addFiles(Array.from(e.dataTransfer.files).filter(f => f.type.startsWith('image/'))));
+fileInput.addEventListener('change', e => { addFiles(Array.from(e.target.files)); fileInput.value = ''; });
+document.getElementById('clear-btn').addEventListener('click', () => {
+  selectedFiles.forEach(f => URL.revokeObjectURL(f.url));
+  selectedFiles = [];
+  activeIndex = -1;
+  panel.classList.remove('open');
+  renderThumbs();
+});
+
+function defaultSettings() { return { fixedSize: null }; }
+
+// fixedSize shape: { axis: 'w'|'h', widthValue, heightValue, widthUnit, heightUnit }
+// Width and height each remember their own value AND their own unit, so
+// setting an exact width in inches and then switching to "exact height" to
+// try "% of page" doesn't reinterpret the still-stored width number under
+// the wrong unit.
+function blankFixedSize() {
+  return { axis: 'w', widthValue: 4, heightValue: 4, widthUnit: 'in', heightUnit: 'in' };
+}
+
+function addFiles(files) {
+  for (const file of files) selectedFiles.push({ file, url: URL.createObjectURL(file), settings: defaultSettings() });
+  selectedFiles.sort((a, b) => a.file.name.localeCompare(b.file.name));
+  renderThumbs();
+}
+
+function renderThumbs() {
+  thumbsEl.innerHTML = '';
+  selectedFiles.forEach((f, i) => {
+    const div = document.createElement('div');
+    div.className = 'thumb' + (i === activeIndex ? ' active' : '');
+    const badges = f.settings.fixedSize ? '<span class="badges"><span>📏</span></span>' : '';
+    div.innerHTML = `<img src="${f.url}" loading="lazy"><span class="idx">${i + 1}</span>${badges}`;
+    div.addEventListener('click', () => openPanel(i));
+    thumbsEl.appendChild(div);
+  });
+  countLine.innerText = selectedFiles.length ? `${selectedFiles.length} photo(s) selected` : 'No photos selected yet';
+  compileBtn.disabled = selectedFiles.length === 0;
+}
+
+function updatePctSliderVisibility() {
+  const isPct = pFixedUnit.value === 'pct';
+  pFixedPctRow.style.display = isPct ? 'flex' : 'none';
+  if (isPct) pFixedPctSlider.value = Math.max(1, Math.min(100, Math.round(parseFloat(pFixedValue.value) || 25)));
+}
+
+function openPanel(i) {
+  activeIndex = i;
+  const f = selectedFiles[i];
+  panelName.textContent = `Photo ${i + 1}: ${f.file.name}`;
+  const fs = f.settings.fixedSize;
+  pFixedOn.checked = !!fs;
+  const axis = fs ? fs.axis : 'w';
+  pFixedAxis.value = axis;
+  pFixedUnit.value = fs ? (axis === 'w' ? fs.widthUnit : fs.heightUnit) : 'in';
+  pFixedValue.value = fs ? (axis === 'w' ? fs.widthValue : fs.heightValue) : 4;
+  updatePctSliderVisibility();
+  panel.classList.add('open');
+  renderThumbs();
+  panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+document.getElementById('panel-close').addEventListener('click', () => { activeIndex = -1; panel.classList.remove('open'); renderThumbs(); });
+
+pFixedAxis.addEventListener('change', () => {
+  if (activeIndex < 0) return;
+  const fs = selectedFiles[activeIndex].settings.fixedSize || blankFixedSize();
+  const axis = pFixedAxis.value;
+  pFixedUnit.value = axis === 'w' ? fs.widthUnit : fs.heightUnit;
+  pFixedValue.value = axis === 'w' ? fs.widthValue : fs.heightValue;
+  updatePctSliderVisibility();
+  syncActiveSettings();
+});
+pFixedUnit.addEventListener('change', updatePctSliderVisibility);
+pFixedPctSlider.addEventListener('input', () => {
+  pFixedValue.value = pFixedPctSlider.value;
+  syncActiveSettings();
+});
+function syncActiveSettings() {
+  if (activeIndex < 0) return;
+  const f = selectedFiles[activeIndex];
+  const prev = f.settings.fixedSize || blankFixedSize();
+  const axis = pFixedAxis.value;
+  const unit = pFixedUnit.value;
+  const value = parseFloat(pFixedValue.value) || 0;
+  if (unit === 'pct') pFixedPctSlider.value = Math.max(1, Math.min(100, Math.round(value)));
+  const next = { ...prev, axis };
+  if (axis === 'w') { next.widthValue = value; next.widthUnit = unit; }
+  else { next.heightValue = value; next.heightUnit = unit; }
+  f.settings.fixedSize = pFixedOn.checked ? next : null;
+  renderThumbs();
+}
+[pFixedOn, pFixedValue, pFixedUnit].forEach(el => el.addEventListener('input', syncActiveSettings));
+[pFixedOn, pFixedUnit].forEach(el => el.addEventListener('change', syncActiveSettings));
+
+// unit === 'pct' means "percent of the page dimension along `axis`" — 25 on
+// axis 'h' means this photo's row is 25% of the page's printable height,
+// regardless of the photo's own pixel resolution.
+function unitToPx(value, unit, axis) {
+  if (unit === 'in') return value * DPI;
+  if (unit === 'cm') return (value / 2.54) * DPI;
+  if (unit === 'mm') return (value / 25.4) * DPI;
+  if (unit === 'pct') return (value / 100) * (axis === 'w' ? PAGE_W : PAGE_H);
+  return value;
+}
+
+// ---------- off-main-thread compositing (prevents UI freeze/black-screen on big jobs) ----------
+// All the actual pixel work (resizing, drawing photos onto a page, JPEG
+// encoding) happens in a small pool of Web Workers using OffscreenCanvas,
+// so the main thread stays free to keep the progress bar and previews
+// responsive. Falls back to plain main-thread canvas work automatically on
+// browsers that don't support OffscreenCanvas.
+const SUPPORTS_OFFSCREEN = typeof OffscreenCanvas !== 'undefined' && typeof Worker !== 'undefined' && typeof createImageBitmap !== 'undefined';
+const RENDER_POOL_SIZE = Math.max(1, Math.min(4, (navigator.hardwareConcurrency || 2)));
+
+const COMPOSE_WORKER_SRC = `
+self.onmessage = async (e) => {
+  const msg = e.data;
+  try {
+    if (msg.type === 'compose') {
+      const { id, width, height, background, ops, quality } = msg;
+      const canvas = new OffscreenCanvas(width, height);
+      const ctx = canvas.getContext('2d');
+      if (background) { ctx.fillStyle = background; ctx.fillRect(0, 0, width, height); }
+      for (const op of ops) {
+        if (op.rotated) {
+          ctx.save();
+          ctx.translate(op.x + op.w, op.y);
+          ctx.rotate(Math.PI / 2);
+          ctx.drawImage(op.bitmap, 0, 0, op.h, op.w);
+          ctx.restore();
+        } else {
+          ctx.drawImage(op.bitmap, op.x, op.y, op.w, op.h);
+        }
+        if (op.bitmap.close) op.bitmap.close();
+      }
+      const blob = await canvas.convertToBlob({ type: 'image/jpeg', quality: quality || 0.92 });
+      self.postMessage({ id, blob });
+    } else if (msg.type === 'resize') {
+      const { id, bitmap, targetW, targetH } = msg;
+      const canvas = new OffscreenCanvas(targetW, targetH);
+      const ctx = canvas.getContext('2d');
+      ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = 'high';
+      ctx.drawImage(bitmap, 0, 0, targetW, targetH);
+      if (bitmap.close) bitmap.close();
+      const out = canvas.transferToImageBitmap();
+      self.postMessage({ id, bitmap: out }, [out]);
+    }
+  } catch (err) {
+    self.postMessage({ id: msg.id, error: (err && err.message) || String(err) });
+  }
+};
+`;
+
+let composeWorkers = [];
+let composeWorkerCursor = 0;
+let composeJobId = 0;
+const composePending = new Map();
+
+function ensureComposeWorkers() {
+  if (composeWorkers.length || !SUPPORTS_OFFSCREEN) return composeWorkers;
+  const blobUrl = URL.createObjectURL(new Blob([COMPOSE_WORKER_SRC], { type: 'application/javascript' }));
+  for (let i = 0; i < RENDER_POOL_SIZE; i++) {
+    const w = new Worker(blobUrl);
+    w.onmessage = (e) => {
+      const { id, blob, bitmap, error } = e.data;
+      const p = composePending.get(id);
+      if (!p) return;
+      composePending.delete(id);
+      if (error) p.reject(new Error(error));
+      else p.resolve(blob !== undefined ? blob : bitmap);
+    };
+    composeWorkers.push(w);
+  }
+  return composeWorkers;
+}
+
+function runComposeJob(msg, transfer) {
+  return new Promise((resolve, reject) => {
+    ensureComposeWorkers();
+    const id = ++composeJobId;
+    composePending.set(id, { resolve, reject });
+    const worker = composeWorkers[composeWorkerCursor % composeWorkers.length];
+    composeWorkerCursor++;
+    worker.postMessage({ ...msg, id }, transfer);
+  });
+}
+
+function blobToDataURL(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = reject;
+    reader.readAsDataURL(blob);
+  });
+}
+
+// Converts any drawable source (ImageBitmap, canvas, img) into a real
+// ImageBitmap, which is the only one of those that's transferable to a
+// worker. ImageBitmaps pass through untouched.
+async function normalizeToBitmap(bmp) {
+  if (bmp instanceof ImageBitmap) return bmp;
+  try { return await createImageBitmap(bmp); } catch (e) { return bmp; }
+}
+
+// ---------- image loading (EXIF-safe, memory-capped) ----------
+async function loadCappedBitmap(url) {
+  const blob = await (await fetch(url)).blob();
+  let bmp;
+  try {
+    bmp = await createImageBitmap(blob, { imageOrientation: 'from-image' });
+  } catch (e) {
+    bmp = await new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => resolve(img);
+      img.onerror = reject;
+      img.src = url;
+    });
+  }
+  const longSide = Math.max(bmp.width, bmp.height);
+  if (longSide <= RENDER_CAP_PX) return bmp;
+  const scale = RENDER_CAP_PX / longSide;
+  const targetW = Math.round(bmp.width * scale), targetH = Math.round(bmp.height * scale);
+  if (SUPPORTS_OFFSCREEN && bmp instanceof ImageBitmap) {
+    return await runComposeJob({ type: 'resize', bitmap: bmp, targetW, targetH }, [bmp]);
+  }
+  const c = document.createElement('canvas');
+  c.width = targetW; c.height = targetH;
+  c.getContext('2d').drawImage(bmp, 0, 0, targetW, targetH);
+  if (bmp.close) bmp.close();
+  return c;
+}
+function releaseBitmap(bmp) { if (bmp && bmp.close) bmp.close(); }
+
+// ---------- OCR result cache (localStorage) ----------
+function ocrCacheKey(file, lang) { return OCR_CACHE_PREFIX + lang + ':' + file.name + ':' + file.size + ':' + file.lastModified; }
+function getOcrCache(file, lang) {
+  try {
+    const raw = localStorage.getItem(ocrCacheKey(file, lang));
+    return raw === null ? undefined : JSON.parse(raw);
+  } catch (e) { return undefined; }
+}
+function setOcrCache(file, lang, metrics) {
+  try { localStorage.setItem(ocrCacheKey(file, lang), JSON.stringify(metrics)); } catch (e) {}
+}
+
+// ---------- justified-gallery row packing ----------
+function justifiedRows(imagesMeta, containerWidth, containerHeight, offsetY = 0, spacing = 0, samples = 400, maxStretch = 1.6) {
+  const n = imagesMeta.length;
+  if (n === 0 || containerHeight <= 0) return [];
+
+  // DP row assignment (Flickr-style justified layout), not greedy. Greedy
+  // row-building closes a row the instant the next image would overflow the
+  // container width, and can never revisit that choice — so a narrow/tall
+  // image sitting right before a wide/landscape one gets stranded alone in
+  // its own row, which then can't be stretched to fill the page width
+  // within the maxStretch guardrail and falls back to a small centered
+  // image with big blank gutters on both sides.
+  //
+  // This instead considers every possible set of row breaks and picks the
+  // partition that minimizes total "badness" (sum of each row's squared
+  // deviation from targetH once stretched to fill the width) — the same
+  // technique real justified-gallery layouts use. It naturally avoids
+  // marooning a single image, because pairing it with a neighbor is almost
+  // always less "bad" than leaving it alone. O(n^2) per candidate height,
+  // which is trivial at per-page image counts (dozens, not thousands).
+  function buildRows(targetH) {
+    const n2 = imagesMeta.length;
+    const widths = imagesMeta.map(it => it.w * (targetH / it.h));
+    const prefix = [0];
+    for (const w of widths) prefix.push(prefix[prefix.length - 1] + w);
+    const INF = Infinity;
+    const cost = new Array(n2 + 1).fill(INF);
+    cost[0] = 0;
+    const breakAt = new Array(n2 + 1).fill(-1);
+    for (let i = 1; i <= n2; i++) {
+      for (let j = i - 1; j >= 0; j--) {
+        const count = i - j;
+        const sumW = prefix[i] - prefix[j] + spacing * (count - 1);
+        if (sumW <= 0) continue;
+        const rowH = targetH * (containerWidth / sumW);
+        const badness = (rowH - targetH) * (rowH - targetH);
+        if (cost[j] !== INF && cost[j] + badness < cost[i]) { cost[i] = cost[j] + badness; breakAt[i] = j; }
+        // Once a candidate row is already 4x too wide, going further back
+        // only makes it wider (rows can't help by growing forever) — stop
+        // searching this branch, it bounds the O(n^2) search in practice.
+        if (sumW > containerWidth * 4) break;
+      }
+    }
+    const rows = [];
+    let idx = n2;
+    while (idx > 0) {
+      const j = breakAt[idx];
+      rows.unshift(imagesMeta.slice(j, idx).map((item, k) => ({ item, scaledW: widths[j + k] })));
+      idx = j;
+    }
+    return rows;
+  }
+  function rowHeightAfterStretch(row, targetH) {
+    const sumW = row.reduce((s, r) => s + r.scaledW, 0) + spacing * (row.length - 1);
+    return targetH * (sumW > 0 ? containerWidth / sumW : 1);
+  }
+  function totalHeightFor(targetH) {
+    const rows = buildRows(targetH);
+    let total = 0;
+    for (const row of rows) {
+      let rh = rowHeightAfterStretch(row, targetH);
+      if (rh > targetH * maxStretch) rh = targetH;
+      total += rh;
+    }
+    total += spacing * (rows.length - 1);
+    return { total, rows };
+  }
+
+  const meanAspect = imagesMeta.reduce((s, it) => s + it.w / it.h, 0) / n;
+  const guess = Math.sqrt((containerWidth * containerHeight) / (n * meanAspect));
+  const lo = Math.max(5, guess * 0.5), hi = guess * 1.8;
+
+  let best = null;
+  for (let i = 0; i < samples; i++) {
+    const t = lo + (hi - lo) * i / (samples - 1);
+    const { total, rows } = totalHeightFor(t);
+    if (total <= containerHeight && (!best || total > best.total)) best = { total, targetH: t, rows };
+  }
+  if (!best) { const { total, rows } = totalHeightFor(lo); best = { total, targetH: lo, rows }; }
+
+  const { targetH, rows } = best;
+  const layout = [];
+  let y = offsetY;
+  for (const row of rows) {
+    let rh = rowHeightAfterStretch(row, targetH);
+    if (rh > targetH * maxStretch) {
+      const rowH = targetH;
+      const totalW = row.reduce((s, r) => s + r.scaledW, 0) + spacing * (row.length - 1);
+      let x = (containerWidth - totalW) / 2;
+      const placed = [];
+      for (const { item, scaledW } of row) { placed.push({ item, x, y, w: scaledW, h: rowH }); x += scaledW + spacing; }
+      layout.push(placed); y += rowH + spacing;
+    } else {
+      const sumW = row.reduce((s, r) => s + r.scaledW, 0) + spacing * (row.length - 1);
+      const scale = sumW > 0 ? containerWidth / sumW : 1;
+      const rowH = targetH * scale;
+      let x = 0;
+      const placed = [];
+      for (const { item, scaledW } of row) { const w = scaledW * scale; placed.push({ item, x, y, w, h: rowH }); x += w + spacing * scale; }
+      layout.push(placed); y += rowH + spacing;
+    }
+  }
+  return layout;
+}
+function layoutFreeItems(freeItems, availH, offsetY) {
+  if (!freeItems.length) return { layout: [], height: 0 };
+  const layout = justifiedRows(freeItems, PAGE_W, availH, offsetY);
+  let maxY = offsetY;
+  for (const row of layout) for (const cell of row) maxY = Math.max(maxY, cell.y + cell.h);
+  return { layout, height: maxY - offsetY };
+}
+
+// ---------- pagination ----------
+// Walks the photo list once, filling each page as full as it can: keeps
+// adding BOTH constrained items (own dedicated row each) and free items onto
+// the same page, in file order, regardless of how they're interleaved.
+// Previously this stopped a page as soon as it saw one run of constrained
+// items followed by one run of free items — so a single OCR-boosted or
+// exact-size photo sitting between two free photos would force a near-empty
+// page with only 2-3 photos on it, even though there was plenty of room
+// left. Now a page only ends when its constrained rows would overflow
+// PAGE_H, its free run runs out of room to squeeze (see below), or the
+// photos run out.
+//
+// Free-item squeeze: restored from the original (pre-OCR/pinning) file's
+// batching, which only ever let the LAST page absorb up to
+// target+overflowThreshold photos — every other page held exactly `target`.
+// A rewrite here had every page (not just the last) squeeze up to
+// target+overflowThreshold free photos, which overstuffed interior pages
+// and left a sparser-than-necessary tail page — the opposite of the tight,
+// even packing the original had. This looks ahead at how many free photos
+// remain before the next constrained item (or end of the list) and only
+// keeps going past `target` if that whole remainder still fits within
+// overflowThreshold, i.e. only the tail of a free run gets squeezed.
+function paginate(items, target, overflowThreshold) {
+  const pages = [];
+  let idx = 0;
+  while (idx < items.length) {
+    const page = { constrained: [], free: [] };
+    let usedHeight = 0;
+    while (idx < items.length) {
+      const it = items[idx];
+      if (it.constraintHeightPx) {
+        const h = Math.min(it.constraintHeightPx, PAGE_H);
+        const pageHasContent = page.constrained.length > 0 || page.free.length > 0;
+        if (pageHasContent && usedHeight + h > PAGE_H) break;
+        page.constrained.push(it);
+        usedHeight += h;
+        idx++;
+      } else {
+        if (page.free.length >= target) {
+          let lookahead = 0, j = idx;
+          while (j < items.length && !items[j].constraintHeightPx) { lookahead++; j++; }
+          if (page.free.length + lookahead > target + overflowThreshold) break;
+          // else: everything left in this free run fits within the
+          // overflow allowance, so keep going and take it all onto this page.
+        }
+        page.free.push(it);
+        idx++;
+      }
+    }
+    pages.push(page);
+  }
+  return pages;
+}
+
+function resolveSizeConstraints(items, target, overflow) {
+  const MAX_ITERS = 6;
+  let pages = paginate(items, target, overflow);
+  for (let iter = 0; iter < MAX_ITERS; iter++) {
+    let changed = false;
+    for (const page of pages) {
+      if (!page.free.length) continue;
+      const usedY = page.constrained.reduce((s, it) => s + Math.min(it.constraintHeightPx, PAGE_H), 0);
+      const { layout } = layoutFreeItems(page.free, PAGE_H - usedY, usedY);
+      for (const row of layout) {
+        for (const cell of row) {
+          const it = cell.item;
+          const effectiveMax = Math.min(it.maxConstraintHeightPx || Infinity, it.globalMaxHeightPx || Infinity);
+          const effectiveMin = it.globalMinHeightPx || 0;
+          if (isFinite(effectiveMax) && cell.h > effectiveMax + 0.5) { it.constraintHeightPx = Math.min(effectiveMax, PAGE_H); changed = true; }
+          else if (effectiveMin && cell.h < effectiveMin - 0.5) { it.constraintHeightPx = Math.min(effectiveMin, PAGE_H); changed = true; }
+        }
+      }
+    }
+    if (!changed) break;
+    pages = paginate(items, target, overflow);
+  }
+  return pages;
+}
+
+// Native w/h with a 90°-rotation applied for layout purposes only — the
+// bitmap itself is never pre-rotated, just drawn rotated (see below).
+function orientedDims(item) {
+  return item.rotated ? { w: item.h, h: item.w } : { w: item.w, h: item.h };
+}
+
+// Pure geometry — no drawing. Works out where/how big a constrained item's
+// dedicated row is, honoring rotation and keeping aspect ratio intact if it
+// would otherwise overflow the page width.
+function constrainedGeometry(item, y) {
+  const od = orientedDims(item);
+  let h = Math.min(item.constraintHeightPx, PAGE_H);
+  let w = od.w * (h / od.h);
+  if (w > PAGE_W) {
+    const s = PAGE_W / w;
+    w = PAGE_W;
+    h *= s;
+  }
+  const x = (PAGE_W - w) / 2;
+  return { x, y, w, h };
+}
+
+// ---------- OCR (worker pool, sparse-text mode, robust size stats) ----------
+async function ocrTextMetricsForWithWorker(worker, bitmap, w, h) {
+  const longSide = Math.max(w, h);
+  const scale = Math.min(4, Math.max(1, OCR_ZOOM_TARGET / longSide));
+  let source = bitmap;
+  if (scale > 1.01) {
+    const targetW = Math.round(w * scale), targetH = Math.round(h * scale);
+    const zoom = document.createElement('canvas');
+    zoom.width = targetW; zoom.height = targetH;
+    if (SUPPORTS_OFFSCREEN && bitmap instanceof ImageBitmap) {
+      // The actual (expensive) upscale happens off-thread; this is just a
+      // cheap same-size blit afterward so Tesseract gets a plain canvas,
+      // which it's guaranteed to accept.
+      const resized = await runComposeJob({ type: 'resize', bitmap, targetW, targetH }, [bitmap]);
+      zoom.getContext('2d').drawImage(resized, 0, 0);
+      if (resized.close) resized.close();
+    } else {
+      const zctx = zoom.getContext('2d');
+      zctx.imageSmoothingEnabled = true; zctx.imageSmoothingQuality = 'high';
+      zctx.drawImage(bitmap, 0, 0, targetW, targetH);
+    }
+    source = zoom;
+  }
+  const { data } = await worker.recognize(source);
+  // Raised from h*0.004 — that let single-pixel texture/noise "words" through,
+  // and one bogus tiny detection was enough to demand a page-eating resize.
+  const minAbsWordPx = Math.max(6, h * 0.012);
+  const heights = (data.words || [])
+    .filter(wd => wd.confidence > 65 && wd.text && wd.text.trim().length > 0)
+    .map(wd => (wd.bbox.y1 - wd.bbox.y0) / scale)
+    .filter(hh => hh >= minAbsWordPx)
+    .sort((a, b) => a - b);
+  // Need at least 3 confident, non-speck detections before trusting this
+  // enough to resize a whole page around it — a lone misread shouldn't count.
+  if (heights.length < 3) return null;
+  const pct = p => heights[Math.min(heights.length - 1, Math.floor(p * (heights.length - 1)))];
+  // Widened from the bottom/top 10% to 25%/75% — much less sensitive to one
+  // stray outlier dragging the "typical" size around.
+  const minWordH = pct(0.25), maxWordH = pct(0.75);
+  return isFinite(minWordH) && minWordH > 0 ? { minWordH, maxWordH } : null;
+}
+
+// Works out how tall a photo needs to be for its smallest confident text to
+// hit minTextPx, and how small it should shrink to for its biggest text to
+// stay under maxTextPx.
+//
+// The old version multiplied the photo's *native camera resolution* by a
+// scale factor and called that the print height — but native photo
+// resolution (often 3000-6000px) is already close to or bigger than a whole
+// printed page (3508px @300dpi), so almost any upscale ≥1 immediately
+// saturated at "one whole page for one photo." The scale factor itself
+// (minTextPx / detected word height, a pure proportion) was correct; the bug
+// was treating raw sensor pixels as if they were print-space pixels.
+//
+// This version keeps that same scale factor (now capped lower, and with the
+// noise-filtering above), but also tries the photo turned 90° before
+// deciding. Rotating a photo doesn't change how much text needs to be
+// magnified — legibility only cares about the physical scale factor — but it
+// does change whether that magnification eats into page *height* or page
+// *width*. Whichever orientation keeps the smaller dimension as height wins,
+// as long as it still fits within the page's width. No mirroring is ever
+// applied — only a plain 90° turn, so nothing reads backwards.
+function ocrHeightRequirement(item, metrics, minTextPx, maxTextPx) {
+  const itW = item.w, itH = item.h;
+  let minH = null, rotated = false, capped = false;
+
+  // Only bother resizing for a meaningfully-off case (>15%), not marginal
+  // ones — cuts down how often OCR claims a dedicated row at all.
+  const scaleForMin = minTextPx / metrics.minWordH;
+  if (scaleForMin > 1.15) {
+    const scale = Math.min(OCR_MAX_UPSCALE, scaleForMin);
+    const normalH = itH * scale, normalW = itW * scale;
+    const rotH = itW * scale, rotW = itH * scale;
+    const fitsNormal = normalW <= PAGE_W + 0.5;
+    const fitsRot = rotW <= PAGE_W + 0.5;
+
+    let pickH, pickRotated;
+    if (fitsNormal && fitsRot) {
+      // Both orientations fit the page width — take whichever needs less height.
+      pickRotated = rotH < normalH;
+      pickH = pickRotated ? rotH : normalH;
+    } else if (fitsRot) {
+      pickH = rotH; pickRotated = true;
+    } else {
+      // Neither fits cleanly (rare, very extreme aspect ratios) — keep the
+      // normal orientation; the renderer will preserve aspect and shrink to
+      // fit width if it still has to.
+      pickH = normalH; pickRotated = false;
+    }
+
+    // Hard ceiling: this one photo can never claim more than
+    // OCR_MAX_PAGE_FRACTION of a page by itself, even in extreme cases —
+    // it'll do the best it can and flag it as a warning instead.
+    const hardCap = PAGE_H * OCR_MAX_PAGE_FRACTION;
+    if (pickH > hardCap) { pickH = hardCap; capped = true; }
+
+    minH = Math.min(pickH, PAGE_H);
+    rotated = pickRotated;
+  }
+
+  const maxScale = maxTextPx / metrics.maxWordH;
+  let maxH = maxScale < 0.85 ? itH * maxScale : null;
+  if (minH && maxH && minH > maxH) maxH = null;
+
+  return { minH, maxH, rotated, capped };
+}
+
+// Scans every item in toScan using a small pool of parallel Tesseract
+// workers (much faster than one at a time), reusing cached results where
+// available. Calls onProgress(done, total) as items complete.
+async function ocrScanAll(toScan, lang, onProgress) {
+  const results = new Array(toScan.length);
+  const uncached = [];
+  toScan.forEach((it, i) => {
+    const cached = getOcrCache(it.file, lang);
+    if (cached !== undefined) results[i] = cached; else uncached.push(i);
+  });
+  let done = toScan.length - uncached.length;
+  onProgress(done, toScan.length);
+  if (!uncached.length) return results;
+
+  const poolSize = Math.min(OCR_POOL_SIZE, uncached.length);
+  const workers = await Promise.all(Array.from({ length: poolSize }, () => Tesseract.createWorker(lang)));
+  await Promise.all(workers.map(w => w.setParameters({ tessedit_pageseg_mode: '11' }).catch(() => {}))); // sparse text — faster than full-page layout analysis
+
+  let cursor = 0;
+  async function runWorker(worker) {
+    while (cursor < uncached.length) {
+      const i = uncached[cursor++];
+      const it = toScan[i];
+      let bmp = null;
+      try {
+        bmp = await loadCappedBitmap(it.url);
+        results[i] = await ocrTextMetricsForWithWorker(worker, bmp, it.w, it.h);
+        setOcrCache(it.file, lang, results[i]);
+      } catch (e) {
+        console.warn('OCR failed for', it.name, e);
+        results[i] = undefined;
+      } finally {
+        releaseBitmap(bmp);
+      }
+      done++;
+      onProgress(done, toScan.length);
+    }
+  }
+  await Promise.all(workers.map(runWorker));
+  await Promise.all(workers.map(w => w.terminate()));
+  return results;
+}
+
+// ---------- split (guillotine crop-fill, last resort) ----------
+function planSplit(bitmap, srcW, srcH, leftoverH) {
+  const fullW = PAGE_W;
+  const fullH = srcW > 0 ? fullW * (srcH / srcW) : PAGE_H;
+  const big = document.createElement('canvas');
+  big.width = fullW; big.height = Math.max(fullH, leftoverH + 1);
+  const bctx = big.getContext('2d');
+  bctx.fillStyle = 'white'; bctx.fillRect(0, 0, big.width, big.height);
+  bctx.drawImage(bitmap, 0, 0, fullW, fullH);
+
+  const pieceAH = Math.max(1, Math.min(leftoverH, fullH));
+  const pieceA = document.createElement('canvas');
+  pieceA.width = fullW; pieceA.height = pieceAH;
+  pieceA.getContext('2d').drawImage(big, 0, 0, fullW, pieceAH, 0, 0, fullW, pieceAH);
+
+  const remH = fullH - pieceAH;
+  let pieceB = null;
+  if (remH > 1) {
+    const pbH = Math.min(remH, PAGE_H);
+    const c = document.createElement('canvas');
+    c.width = fullW; c.height = pbH;
+    c.getContext('2d').drawImage(big, 0, pieceAH, fullW, pbH, 0, 0, fullW, pbH);
+    pieceB = { bitmap: c, w: fullW, h: pbH };
+  }
+  return { pieceA: { bitmap: pieceA, w: fullW, h: pieceAH }, pieceB };
+}
+
+function longEdgeTargetToHeightPx(item, targetLongPx) {
+  return item.w >= item.h ? targetLongPx * (item.h / item.w) : targetLongPx;
+}
+function setStatus(text, kind) { statusLine.className = 'status' + (kind ? ' ' + kind : ''); statusLine.innerText = text; }
+
+// ---------- live state kept around after a compile, for interactive edits ----------
+let liveItems = [], livePages = [], liveConfig = { target: 16, overflow: 4 }, livePageRenders = [], selectedEditItem = null;
+
+async function renderPageToCanvas(page) {
+  const placements = [];
+  const ops = [];
+  let y = 0;
+
+  for (const item of page.constrained) {
+    let bmp = item.prepared ? item.bitmap : await loadCappedBitmap(item.url);
+    if (SUPPORTS_OFFSCREEN) bmp = await normalizeToBitmap(bmp);
+    const { x, y: gy, w, h } = constrainedGeometry(item, y);
+    ops.push({ bitmap: bmp, x, y: gy, w, h, rotated: !!item.rotated });
+    if (item.file) placements.push({ item, x, y: gy, w, h });
+    y += h;
+  }
+  if (page.free.length) {
+    const { layout } = layoutFreeItems(page.free, PAGE_H - y, y);
+    for (const row of layout) {
+      for (const { item, x, y: ry, w, h } of row) {
+        let bmp = await loadCappedBitmap(item.url);
+        if (SUPPORTS_OFFSCREEN) bmp = await normalizeToBitmap(bmp);
+        ops.push({ bitmap: bmp, x, y: ry, w, h, rotated: false });
+        if (item.file) placements.push({ item, x, y: ry, w, h });
+      }
+    }
+  }
+  if (page.splitFill) {
+    const sf = page.splitFill;
+    let bmp = sf.bitmap;
+    if (SUPPORTS_OFFSCREEN) bmp = await normalizeToBitmap(bmp);
+    ops.push({ bitmap: bmp, x: 0, y: sf.y, w: sf.w, h: sf.h, rotated: false });
+  }
+
+  if (SUPPORTS_OFFSCREEN) {
+    // The actual pixel compositing + JPEG encode happens in a worker, off
+    // the main thread — this is the step that used to cause noticeable
+    // stutter/black-screen flashes on pages with a lot of photos.
+    const transferables = ops.map(o => o.bitmap).filter(b => b instanceof ImageBitmap);
+    const blob = await runComposeJob(
+      { type: 'compose', width: PAGE_W, height: PAGE_H, background: 'white', ops, quality: 0.92 },
+      transferables
+    );
+    const dataUrl = await blobToDataURL(blob);
+    return { dataUrl, placements };
+  }
+
+  // Main-thread fallback for browsers without OffscreenCanvas/Worker support.
+  const canvas = document.createElement('canvas');
+  canvas.width = PAGE_W; canvas.height = PAGE_H;
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = 'white'; ctx.fillRect(0, 0, PAGE_W, PAGE_H);
+  for (const op of ops) {
+    if (op.rotated) {
+      ctx.save();
+      ctx.translate(op.x + op.w, op.y);
+      ctx.rotate(Math.PI / 2);
+      ctx.drawImage(op.bitmap, 0, 0, op.h, op.w);
+      ctx.restore();
+    } else {
+      ctx.drawImage(op.bitmap, op.x, op.y, op.w, op.h);
+    }
+    releaseBitmap(op.bitmap);
+  }
+  return { dataUrl: canvas.toDataURL('image/jpeg', 0.92), placements };
+}
+
+function renderInteractivePreviews() {
+  pagePreviews.innerHTML = '';
+  livePageRenders.forEach((pr, pIdx) => {
+    const wrap = document.createElement('div');
+    wrap.className = 'page-preview-wrap';
+    const canvas = document.createElement('canvas');
+    const img = new Image();
+    img.onload = () => {
+      const dispH = 200, dispW = dispH * (img.width / img.height);
+      canvas.width = img.width; canvas.height = img.height;
+      canvas.style.width = dispW + 'px'; canvas.style.height = dispH + 'px';
+      canvas.getContext('2d').drawImage(img, 0, 0);
+    };
+    img.src = pr.dataUrl;
+    canvas.addEventListener('click', (e) => {
+      const rect = canvas.getBoundingClientRect();
+      const scaleX = canvas.width / rect.width, scaleY = canvas.height / rect.height;
+      const px = (e.clientX - rect.left) * scaleX, py = (e.clientY - rect.top) * scaleY;
+      const hit = pr.placements.find(p => px >= p.x && px <= p.x + p.w && py >= p.y && py <= p.y + p.h);
+      if (hit) openEditPopover(hit.item, hit);
+    });
+    const num = document.createElement('span');
+    num.className = 'page-num'; num.textContent = `Page ${pIdx + 1}`;
+    wrap.appendChild(canvas); wrap.appendChild(num);
+    pagePreviews.appendChild(wrap);
+  });
+}
+
+function updateEditPctSliderVisibility() {
+  const isPct = editUnit.value === 'pct';
+  editPctRow.style.display = isPct ? 'flex' : 'none';
+  if (isPct) editPctSlider.value = Math.max(1, Math.min(100, Math.round(parseFloat(editValue.value) || 25)));
+}
+editUnit.addEventListener('change', updateEditPctSliderVisibility);
+editPctSlider.addEventListener('input', () => { editValue.value = editPctSlider.value; });
+
+function openEditPopover(item, placement) {
+  selectedEditItem = item;
+  editPopoverName.textContent = item.name;
+  editPopoverCur.textContent = `Currently printing about ${(placement.w / DPI).toFixed(2)}in × ${(placement.h / DPI).toFixed(2)}in` + (item.manualPin ? ' (manually pinned)' : '');
+  editAxis.value = 'h'; editValue.value = (placement.h / DPI).toFixed(2); editUnit.value = 'in';
+  updateEditPctSliderVisibility();
+  editUnpinBtn.style.display = item.manualPin ? 'block' : 'none';
+  editPopover.classList.add('open');
+}
+editPinBtn.addEventListener('click', async () => {
+  if (!selectedEditItem) return;
+  const px = unitToPx(parseFloat(editValue.value) || 0, editUnit.value, editAxis.value);
+  selectedEditItem.constraintHeightPx = Math.min(editAxis.value === 'h' ? px : px * (selectedEditItem.h / selectedEditItem.w), PAGE_H);
+  selectedEditItem.rotated = false; // manual pin always wins outright — no leftover auto-rotation
+  selectedEditItem.locked = true;
+  selectedEditItem.manualPin = true;
+  editPopover.classList.remove('open');
+  await relayoutAndRerender();
+});
+editUnpinBtn.addEventListener('click', async () => {
+  if (!selectedEditItem) return;
+  selectedEditItem.constraintHeightPx = null;
+  selectedEditItem.maxConstraintHeightPx = null;
+  selectedEditItem.rotated = false;
+  selectedEditItem.locked = false;
+  selectedEditItem.manualPin = false;
+  editPopover.classList.remove('open');
+  await relayoutAndRerender();
+});
+
+async function relayoutAndRerender() {
+  setStatus('Re-laying out around your edit...', 'running');
+  progressOuter.style.display = 'block'; progressInner.style.width = '0%';
+  closeReadabilityCheck(); // old issue markers reference placements that no longer exist once we re-layout
+  livePages = resolveSizeConstraints(liveItems, liveConfig.target, liveConfig.overflow);
+  livePageRenders = [];
+  for (let i = 0; i < livePages.length; i++) {
+    livePageRenders.push(await renderPageToCanvas(livePages[i]));
+    progressInner.style.width = `${Math.round(((i + 1) / livePages.length) * 100)}%`;
+  }
+  renderInteractivePreviews();
+  setStatus(`Re-laid out — ${livePages.length} page(s). Export when you're happy with it.`, 'done');
+  exportBtn.style.display = 'block';
+  checkReadabilityBtn.style.display = 'block';
+}
+
+// ---------- readability check (re-verifies text size against the CURRENT layout) ----------
+// Uses the same OCR cache as the main scan, so this is fast — it's not
+// re-reading every photo's pixels again, just re-comparing already-known text
+// metrics against wherever each photo actually ended up printing right now
+// (which may have changed since the metrics were first measured, e.g. after
+// the global size slider or a manual pin).
+let readabilityIssues = [];
+let readabilityIndex = -1;
+
+function closeReadabilityCheck() {
+  readabilityIssues = [];
+  readabilityIndex = -1;
+  issueNav.style.display = 'none';
+  document.querySelectorAll('.issue-marker').forEach(m => m.remove());
+}
+
+function gotoIssue(i) {
+  if (!readabilityIssues.length) return;
+  readabilityIndex = ((i % readabilityIssues.length) + readabilityIssues.length) % readabilityIssues.length;
+  const issue = readabilityIssues[readabilityIndex];
+  document.querySelectorAll('.issue-marker').forEach(m => m.classList.remove('current'));
+  if (issue.markerEl) issue.markerEl.classList.add('current');
+  const wraps = document.querySelectorAll('.page-preview-wrap');
+  const wrap = wraps[issue.pageIndex];
+  if (wrap) wrap.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'center' });
+  issueNavInfo.textContent = `Issue ${readabilityIndex + 1} of ${readabilityIssues.length}: "${issue.item.name}" — text prints ~${Math.round(issue.effectivePx)}px, ${issue.tooSmall ? 'below' : 'above'} your ${issue.thresholdPx}px ${issue.tooSmall ? 'minimum' : 'maximum'} (page ${issue.pageIndex + 1}). Tap the photo to pin a size, or use ◀ ▶ / arrow keys to keep browsing.`;
+}
+
+function renderIssueMarkers() {
+  document.querySelectorAll('.issue-marker').forEach(m => m.remove());
+  const wraps = document.querySelectorAll('.page-preview-wrap');
+  readabilityIssues.forEach(issue => {
+    const wrap = wraps[issue.pageIndex];
+    if (!wrap) return;
+    const marker = document.createElement('div');
+    marker.className = 'issue-marker';
+    marker.style.left = (issue.placement.x / PAGE_W * 100) + '%';
+    marker.style.top = (issue.placement.y / PAGE_H * 100) + '%';
+    marker.style.width = (issue.placement.w / PAGE_W * 100) + '%';
+    marker.style.height = (issue.placement.h / PAGE_H * 100) + '%';
+    wrap.appendChild(marker);
+    issue.markerEl = marker;
+  });
+}
+
+async function runReadabilityCheck() {
+  if (!liveItems.length) return;
+  closeReadabilityCheck();
+  const lang = document.getElementById('ocr-lang').value;
+  const minTextPx = Math.max(4, parseFloat(ocrMinPx.value) || 28);
+  const maxTextPx = Math.max(minTextPx + 1, parseFloat(ocrMaxPx.value) || 160);
+
+  setStatus('Re-checking readability at the current layout...', 'running');
+  progressOuter.style.display = 'block'; progressInner.style.width = '0%';
+
+  const results = await ocrScanAll(liveItems, lang, (done, total) => {
+    setStatus(`Checking readability (${done}/${total})...`, 'running');
+    progressInner.style.width = `${Math.round((done / total) * 100)}%`;
+  });
+  liveItems.forEach((it, i) => { if (results[i]) it.ocrMetrics = results[i]; });
+  refreshOcrCacheNote();
+
+  // Map each item to wherever it's actually printing right now.
+  const placementByItem = new Map();
+  livePageRenders.forEach((pr, pIdx) => {
+    pr.placements.forEach(p => placementByItem.set(p.item, { pageIndex: pIdx, ...p }));
+  });
+
+  const issues = [];
+  liveItems.forEach((it) => {
+    const metrics = it.ocrMetrics;
+    if (!metrics) return;
+    const placement = placementByItem.get(it);
+    if (!placement) return;
+    const nativeAxisH = it.rotated ? it.w : it.h; // native dimension mapped onto the placement's displayed height
+    const scaleRatio = placement.h / nativeAxisH;
+    const effMinPx = metrics.minWordH * scaleRatio;
+    const effMaxPx = metrics.maxWordH * scaleRatio;
+    if (effMinPx < minTextPx) {
+      issues.push({ item: it, pageIndex: placement.pageIndex, placement, effectivePx: effMinPx, thresholdPx: Math.round(minTextPx), tooSmall: true });
+    } else if (effMaxPx > maxTextPx) {
+      issues.push({ item: it, pageIndex: placement.pageIndex, placement, effectivePx: effMaxPx, thresholdPx: Math.round(maxTextPx), tooSmall: false });
+    }
+  });
+
+  progressInner.style.width = '100%';
+  readabilityIssues = issues;
+  if (!issues.length) {
+    setStatus('✅ Checked — no readability problems at the current layout.', 'done');
+    return;
+  }
+  renderIssueMarkers();
+  issueNav.style.display = 'block';
+  gotoIssue(0);
+  setStatus(`⚠️ Found ${issues.length} photo(s) whose text may be hard to read at their current size.`, 'warn');
+}
+
+checkReadabilityBtn.addEventListener('click', runReadabilityCheck);
+issuePrevBtn.addEventListener('click', () => gotoIssue(readabilityIndex - 1));
+issueNextBtn.addEventListener('click', () => gotoIssue(readabilityIndex + 1));
+issueCloseBtn.addEventListener('click', closeReadabilityCheck);
+document.addEventListener('keydown', (e) => {
+  if (!readabilityIssues.length) return;
+  const tag = (document.activeElement && document.activeElement.tagName) || '';
+  if (['INPUT', 'TEXTAREA', 'SELECT'].includes(tag)) return; // don't hijack arrow keys while typing elsewhere
+  if (e.key === 'ArrowRight' || e.key === 'ArrowDown') { e.preventDefault(); gotoIssue(readabilityIndex + 1); }
+  else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') { e.preventDefault(); gotoIssue(readabilityIndex - 1); }
+  else if (e.key === 'Escape') { closeReadabilityCheck(); }
+});
+
+exportBtn.addEventListener('click', async () => {
+  if (!livePageRenders.length) return;
+  setStatus('Building PDF...', 'running');
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF({ unit: 'pt', format: 'a4' });
+  livePageRenders.forEach((pr, i) => { if (i > 0) doc.addPage('a4', 'portrait'); doc.addImage(pr.dataUrl, 'JPEG', 0, 0, 595.28, 841.89); });
+  doc.save('optimized_print.pdf');
+  setStatus(`Exported ${livePageRenders.length} page(s).`, 'done');
+});
+
+compileBtn.addEventListener('click', async () => {
+  const target = Math.max(1, parseInt(document.getElementById('base_count').value, 10) || 16);
+  const overflow = Math.max(0, parseInt(document.getElementById('threshold').value, 10) || 0);
+  const globalSizePercent = parseFloat(globalSizeInput.value) || 0;
+  const sizeMultiplier = Math.max(0.05, 1 + globalSizePercent / 100); // -100% floored at -95% so nothing vanishes
+  // Fewer/more photos fit per page as they get bigger/smaller — this is how
+  // the slider actually changes the free-packed photos' size, since they're
+  // otherwise auto-solved to fill the page exactly.
+  const effectiveTarget = Math.max(1, Math.round(target / sizeMultiplier));
+  const useSplit = splitOn.checked;
+  const useSizeCap = sizecapOn.checked;
+  const useOcr = ocrOn.checked;
+  const useOcrOverrideExact = ocrOverrideExact.checked;
+  const minTextPx = Math.max(4, parseFloat(ocrMinPx.value) || 28);
+  const maxTextPx = Math.max(minTextPx + 1, parseFloat(ocrMaxPx.value) || 160);
+  const lang = document.getElementById('ocr-lang').value;
+  const globalMinLongPx = useSizeCap ? unitToPx(parseFloat(sizecapMinValue.value) || 0, sizecapMinUnit.value) : 0;
+  const globalMaxLongPxRaw = useSizeCap ? unitToPx(parseFloat(sizecapMaxValue.value) || 0, sizecapMaxUnit.value) : Infinity;
+  const globalMaxLongPx = globalMaxLongPxRaw > globalMinLongPx ? globalMaxLongPxRaw : Infinity;
+
+  compileBtn.disabled = true;
+  exportBtn.style.display = 'none';
+  checkReadabilityBtn.style.display = 'none';
+  closeReadabilityCheck();
+  progressOuter.style.display = 'block'; progressInner.style.width = '0%';
+  pagePreviews.innerHTML = '';
+  setStatus('Reading photo dimensions...', 'running');
+
+  try {
+    // 1. Lightweight item records (dimensions only — no pixels held).
+    const items = [];
+    for (let i = 0; i < selectedFiles.length; i++) {
+      const f = selectedFiles[i];
+      setStatus(`Reading photo dimensions (${i + 1}/${selectedFiles.length})...`, 'running');
+      await new Promise(r => setTimeout(r, 0));
+      const bmp = await loadCappedBitmap(f.url);
+      items.push({
+        w: bmp.width, h: bmp.height, url: f.url, file: f.file, settings: f.settings, name: f.file.name,
+        constraintHeightPx: null, maxConstraintHeightPx: null, globalMinHeightPx: null, globalMaxHeightPx: null,
+        hasText: false, locked: false, manualPin: false, rotated: false,
+      });
+      releaseBitmap(bmp);
+    }
+
+    // 2. Priority 1 — exact size lock.
+    for (const it of items) {
+      if (it.settings.fixedSize) {
+        const { axis, widthValue, heightValue, widthUnit, heightUnit } = it.settings.fixedSize;
+        const value = axis === 'w' ? widthValue : heightValue;
+        const unit = axis === 'w' ? widthUnit : heightUnit;
+        const px = unitToPx(value, unit, axis);
+        it.constraintHeightPx = Math.min(axis === 'h' ? px : px * (it.h / it.w), PAGE_H);
+        it.locked = true;
+      }
+    }
+
+    // 3. Priority 2 — OCR, parallel pool. Locked photos are scanned too, to
+    //    override (if enabled) or warn rather than silently resize.
+    const warnings = [];
+    if (useOcr) {
+      const toScan = items.filter(it => !it.constraintHeightPx || it.locked);
+      const results = await ocrScanAll(toScan, lang, (done, total) => {
+        setStatus(`Scanning for text (${done}/${total})...`, 'running');
+      });
+      refreshOcrCacheNote();
+      for (let i = 0; i < toScan.length; i++) {
+        const it = toScan[i], metrics = results[i];
+        if (!metrics) continue;
+        it.hasText = true;
+        if (it.locked) {
+          const scale = it.constraintHeightPx / it.h;
+          const effMin = metrics.minWordH * scale, effMax = metrics.maxWordH * scale;
+          const tooSmall = effMin < minTextPx, tooBig = effMax > maxTextPx;
+          if ((tooSmall || tooBig) && useOcrOverrideExact) {
+            const req = ocrHeightRequirement(it, metrics, minTextPx, maxTextPx);
+            it.constraintHeightPx = req.minH || req.maxH || it.constraintHeightPx;
+            it.maxConstraintHeightPx = req.maxH;
+            it.rotated = req.rotated;
+            it.locked = false;
+            warnings.push(`"${it.name}"'s exact size was overridden for text readability (text was ${tooSmall ? 'too small' : 'too large'}).`);
+            if (req.capped) warnings.push(`"${it.name}"'s readability boost was capped so it can't take over the page — its smallest text may still print a bit under your minimum.`);
+            if (req.rotated) warnings.push(`"${it.name}" was rotated 90° so that boost takes less page height (no mirroring — just turn the photo to read it).`);
+          } else if (tooSmall) {
+            warnings.push(`"${it.name}" is locked to an exact size but its smallest text would print below your minimum (~${effMin.toFixed(0)}px vs ${minTextPx}px) — unchanged since override is off.`);
+          }
+          continue;
+        }
+        const req = ocrHeightRequirement(it, metrics, minTextPx, maxTextPx);
+        it.constraintHeightPx = req.minH;
+        it.maxConstraintHeightPx = req.maxH;
+        it.rotated = req.rotated;
+        if (req.capped) warnings.push(`"${it.name}"'s readability boost was capped so it can't take over the page — its smallest text may still print a bit under your minimum.`);
+        if (req.rotated) warnings.push(`"${it.name}" was rotated 90° so its readability boost takes less page height (no mirroring — just turn the photo to read it).`);
+      }
+    }
+
+    // 3b. Fill-width for OCR-driven dedicated rows. A dedicated row only
+    // scales itself down if it's too WIDE for the page (see
+    // constrainedGeometry) — it never scales up to fill leftover width, so
+    // a narrow/portrait photo that only needed a modest height boost for
+    // legibility was left centered with blank gutters on both sides. That's
+    // correct behavior for a photo you explicitly pinned to an exact size
+    // (`it.locked === true` — respect the measurement exactly, don't
+    // second-guess it) but pointless for a photo OCR sized on its own: OCR
+    // only guarantees a *minimum* readable height, so growing it a bit to
+    // fill the row costs nothing and only helps.
+    //
+    // Capped at 1.6x (matching the free-row stretch cap) rather than
+    // literally filling the page width — a portrait photo's aspect ratio
+    // means fully spanning page width would force its height past the
+    // whole page, crowding out everything else that page. This narrows the
+    // blank gutters without letting one photo swallow the page. Also capped
+    // by the "text too big" ceiling (if any), the same limit OCR itself
+    // already respects.
+    const DEDICATED_ROW_MAX_STRETCH = 1.6;
+    for (const it of items) {
+      if (!it.constraintHeightPx || it.locked) continue;
+      const od = orientedDims(it);
+      const h = Math.min(it.constraintHeightPx, PAGE_H);
+      const w = od.w * (h / od.h);
+      if (w >= PAGE_W - 0.5) continue;
+      const maxH = Math.min(it.maxConstraintHeightPx || Infinity, PAGE_H, h * DEDICATED_ROW_MAX_STRETCH);
+      const scale = Math.min(PAGE_W / w, maxH / h);
+      if (scale > 1.001) it.constraintHeightPx = h * scale;
+    }
+
+    // 3.5. Global size slider — scales every already-computed exact-size and
+    // OCR-driven constraint height uniformly, on top of the OCR/exact-size
+    // math above (which decides *whether* a photo needs a dedicated size at
+    // all; this just resizes the outcome). Base values are snapshotted first
+    // so moving the slider again later rescales from the original numbers
+    // instead of compounding on top of the last scale.
+    for (const it of items) {
+      it.baseConstraintHeightPx = it.constraintHeightPx;
+      it.baseMaxConstraintHeightPx = it.maxConstraintHeightPx;
+    }
+    applyGlobalSizeMultiplier(items, sizeMultiplier);
+
+    // 4. Global size-range bounds (numeric only).
+    if (useSizeCap) {
+      for (const it of items) {
+        if (it.locked) continue;
+        if (globalMinLongPx > 0) it.globalMinHeightPx = longEdgeTargetToHeightPx(it, globalMinLongPx);
+        if (isFinite(globalMaxLongPx)) it.globalMaxHeightPx = longEdgeTargetToHeightPx(it, globalMaxLongPx);
+      }
+    }
+
+    // 5. Paginate (includes size-constraint iterative promotion — pure geometry).
+    let pages = resolveSizeConstraints(items, effectiveTarget, overflow);
+
+    // 6. Priority 3 — split.
+    if (useSplit) {
+      for (let p = 0; p < pages.length - 1; p++) {
+        const page = pages[p], nextPage = pages[p + 1];
+        const usedY = page.constrained.reduce((s, it) => s + Math.min(it.constraintHeightPx, PAGE_H), 0);
+        const { height: freeH } = layoutFreeItems(page.free, PAGE_H - usedY, usedY);
+        const leftover = PAGE_H - usedY - freeH;
+        if (leftover < SPLIT_MIN_GAP_PX) continue;
+        const idx = nextPage.free.findIndex(it => !it.locked && !it.hasText);
+        if (idx < 0) continue;
+        const [victim] = nextPage.free.splice(idx, 1);
+        setStatus(`Preparing puzzle split for "${victim.name}"...`, 'running');
+        await new Promise(r => setTimeout(r, 0));
+        const victimBmp = await loadCappedBitmap(victim.url);
+        const { pieceA, pieceB } = planSplit(victimBmp, victim.w, victim.h, leftover);
+        releaseBitmap(victimBmp);
+        page.splitFill = { bitmap: pieceA.bitmap, w: pieceA.w, h: pieceA.h, y: usedY + freeH };
+        if (pieceB) nextPage.constrained.unshift({ constraintHeightPx: pieceB.h, w: pieceB.w, h: pieceB.h, bitmap: pieceB.bitmap, prepared: true });
+      }
+    }
+
+    // 7. Render pages, one at a time, storing placements for interactivity.
+    const pageRenders = [];
+    for (let p = 0; p < pages.length; p++) {
+      setStatus(`Compiling page ${p + 1} of ${pages.length}...`, 'running');
+      await new Promise(r => setTimeout(r, 0));
+      pageRenders.push(await renderPageToCanvas(pages[p]));
+      progressInner.style.width = `${Math.round(((p + 1) / pages.length) * 100)}%`;
+    }
+
+    liveItems = items; livePages = pages; liveConfig = { target: effectiveTarget, overflow }; livePageRenders = pageRenders;
+    renderInteractivePreviews();
+    exportBtn.style.display = 'block';
+    checkReadabilityBtn.style.display = 'block';
+
+    const { jsPDF } = window.jspdf;
+    const doc = new jsPDF({ unit: 'pt', format: 'a4' });
+    pageRenders.forEach((pr, i) => { if (i > 0) doc.addPage('a4', 'portrait'); doc.addImage(pr.dataUrl, 'JPEG', 0, 0, 595.28, 841.89); });
+    doc.save('optimized_print.pdf');
+
+    progressInner.style.width = '100%';
+    let msg = `Done — ${pages.length} page(s) compiled and downloaded. Tap any photo above to pin its size and re-export.`;
+    if (sizeMultiplier !== 1) msg += ` (Overall size: ${globalSizePercent > 0 ? '+' : ''}${globalSizePercent}%.)`;
+    if (warnings.length) msg += '\n\n⚠️ ' + warnings.join('\n⚠️ ');
+    setStatus(msg, warnings.length ? 'warn' : 'done');
+  } catch (err) {
+    console.error(err);
+    setStatus('Error: ' + err.message, 'error');
+  } finally {
+    compileBtn.disabled = false;
+  }
+});
+</script>
+</body>
+</html>
