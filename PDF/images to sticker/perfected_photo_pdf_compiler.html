@@ -79,7 +79,7 @@
     </div>
     <div class="count-line" id="count-line"></div>
     <div class="thumbs" id="thumbs"></div>
-    <div class="note">Tap a photo to give it an exact print size. After compiling, tap any photo in a page preview to pin its size by hand — neighbors reflow around it. Badge: 📏 = exact size set.</div>
+    <div class="note">Tap a photo to give it an exact print size. After compiling, tap any photo in a page preview to pin its size by hand — a pinned photo always keeps the exact size you gave it, but any other photo that already fits beside it without being resized will sit in the gutter instead of leaving it blank. There's also an option to auto-rotate a pin 90° if that leaves less blank space. Badge: 📏 = exact size set.</div>
 
     <div class="panel" id="photo-panel">
       <div class="panel-title"><span id="panel-name">Photo settings</span><button id="panel-close">✕</button></div>
@@ -218,7 +218,7 @@
       </div>
     </div>
     <div class="page-previews" id="page-previews"></div>
-    <div class="note">Tap any photo in a preview above to pin its size and re-flow its neighbors, then "Export PDF" to download the updated result. "Check Readability" re-checks text against the sizes photos are <i>actually</i> printing at right now (after any resizing you've done) and highlights anything that's gotten too small — use ◀ ▶ or the arrow keys to step through flagged photos. Photos are decoded and released one at a time (or one page at a time) rather than all held in memory together.</div>
+    <div class="note">Tap any photo in a preview above to pin its size — a photo that already fits beside it will fill the gutter instead of leaving it blank, and pinning never shrinks anyone else. Then "Export PDF" to download the updated result. Only the page(s) actually affected by your edit get re-rendered, so pinning stays fast even with hundreds of photos. "Check Readability" re-checks text against the sizes photos are <i>actually</i> printing at right now (after any resizing you've done) and highlights anything that's gotten too small — use ◀ ▶ or the arrow keys to step through flagged photos. Photos are decoded and released one at a time (or one page at a time) rather than all held in memory together.</div>
   </div>
 
   <div class="edit-popover" id="edit-popover">
@@ -236,6 +236,10 @@
     </div>
     <div class="sub-row" id="edit-pct-row" style="display:none; margin-top:8px;">
       <input type="range" id="edit-pct-slider" min="1" max="100" step="1" value="25" style="flex:1;">
+    </div>
+    <div class="check-line" style="margin:8px 0 0 0;">
+      <input type="checkbox" id="edit-auto-rotate">
+      <label for="edit-auto-rotate" style="margin:0;">Auto-rotate 90° if it leaves less blank space beside it</label>
     </div>
     <div class="flex-grid" style="margin-top:8px;">
       <button class="btn" id="edit-pin-btn" style="margin:0;">📌 Pin & Re-layout</button>
@@ -321,7 +325,7 @@ async function applyGlobalSizeRelayout() {
   const effectiveTarget = Math.max(1, Math.round(target / sizeMultiplier));
 
   applyGlobalSizeMultiplier(liveItems, sizeMultiplier);
-  liveConfig = { target: effectiveTarget, overflow };
+  liveConfig = { ...liveConfig, target: effectiveTarget, overflow };
   await relayoutAndRerender();
 }
 globalSizeSlider.addEventListener('change', applyGlobalSizeRelayout);
@@ -356,6 +360,7 @@ const editPinBtn = document.getElementById('edit-pin-btn');
 const editUnpinBtn = document.getElementById('edit-unpin-btn');
 const editPctRow = document.getElementById('edit-pct-row');
 const editPctSlider = document.getElementById('edit-pct-slider');
+const editAutoRotate = document.getElementById('edit-auto-rotate');
 document.getElementById('edit-close-btn').addEventListener('click', () => editPopover.classList.remove('open'));
 
 const checkReadabilityBtn = document.getElementById('check-readability-btn');
@@ -410,6 +415,14 @@ document.getElementById('clear-btn').addEventListener('click', () => {
   activeIndex = -1;
   panel.classList.remove('open');
   renderThumbs();
+
+  releaseAllPageRenders(livePageRenders);
+  releaseAllPreviewImages();
+  liveItems = []; livePages = []; livePageRenders = [];
+  closeReadabilityCheck();
+  pagePreviews.innerHTML = '';
+  exportBtn.style.display = 'none';
+  checkReadabilityBtn.style.display = 'none';
 });
 
 function defaultSettings() { return { fixedSize: null }; }
@@ -597,6 +610,23 @@ function blobToDataURL(blob) {
     reader.onerror = reject;
     reader.readAsDataURL(blob);
   });
+}
+
+// A page render is kept alive for as long as it's on screen or exportable.
+// It's stored as a Blob (not a base64 dataURL string — ~25% smaller and
+// avoids holding two encoded copies of the same bytes) plus an object URL
+// for the preview <img> to point at. Object URLs must be explicitly revoked
+// or the browser keeps their backing blob alive for the life of the page —
+// releasePageRender is the single place that happens.
+function finalizePageRender(raw) {
+  raw.objectUrl = URL.createObjectURL(raw.blob);
+  return raw;
+}
+function releasePageRender(pr) {
+  if (pr && pr.objectUrl) URL.revokeObjectURL(pr.objectUrl);
+}
+function releaseAllPageRenders(list) {
+  for (const pr of list) releasePageRender(pr);
 }
 
 // Converts any drawable source (ImageBitmap, canvas, img) into a real
@@ -814,6 +844,31 @@ function paginate(items, target, overflowThreshold) {
   return pages;
 }
 
+// Priority 3 — split. Extracted so it can be re-run whenever pages are
+// recomputed (initial compile AND every later relayout/pin) — previously
+// this only ran once during the initial compile, so pinning or unpinning
+// anything afterward silently discarded any splits already made without
+// telling you.
+async function applySplit(pages) {
+  for (let p = 0; p < pages.length - 1; p++) {
+    const page = pages[p], nextPage = pages[p + 1];
+    const usedY = page.constrained.reduce((s, it) => s + Math.min(it.constraintHeightPx, PAGE_H), 0);
+    const { height: freeH } = layoutFreeItems(page.free, PAGE_H - usedY, usedY);
+    const leftover = PAGE_H - usedY - freeH;
+    if (leftover < SPLIT_MIN_GAP_PX) continue;
+    const idx = nextPage.free.findIndex(it => !it.locked && !it.hasText);
+    if (idx < 0) continue;
+    const [victim] = nextPage.free.splice(idx, 1);
+    setStatus(`Preparing puzzle split for "${victim.name}"...`, 'running');
+    await new Promise(r => setTimeout(r, 0));
+    const victimBmp = await loadCappedBitmap(victim.url);
+    const { pieceA, pieceB } = planSplit(victimBmp, victim.w, victim.h, leftover);
+    releaseBitmap(victimBmp);
+    page.splitFill = { bitmap: pieceA.bitmap, w: pieceA.w, h: pieceA.h, y: usedY + freeH };
+    if (pieceB) nextPage.constrained.unshift({ constraintHeightPx: pieceB.h, w: pieceB.w, h: pieceB.h, bitmap: pieceB.bitmap, prepared: true });
+  }
+}
+
 function resolveSizeConstraints(items, target, overflow) {
   const MAX_ITERS = 6;
   let pages = paginate(items, target, overflow);
@@ -847,7 +902,9 @@ function orientedDims(item) {
 
 // Pure geometry — no drawing. Works out where/how big a constrained item's
 // dedicated row is, honoring rotation and keeping aspect ratio intact if it
-// would otherwise overflow the page width.
+// would otherwise overflow the page width. If the item has side-fills (see
+// applySideFill below) they're placed at the same row height alongside it,
+// and the whole group — pin plus fills — is centered together.
 function constrainedGeometry(item, y) {
   const od = orientedDims(item);
   let h = Math.min(item.constraintHeightPx, PAGE_H);
@@ -857,8 +914,64 @@ function constrainedGeometry(item, y) {
     w = PAGE_W;
     h *= s;
   }
-  const x = (PAGE_W - w) / 2;
-  return { x, y, w, h };
+  const fills = item.sideFills || [];
+  const gap = fills.length ? 24 : 0;
+  const totalW = w + fills.reduce((s, f) => s + f.w, 0) + gap * fills.length;
+  let x = Math.max(0, (PAGE_W - totalW) / 2);
+  const main = { x, y, w, h };
+  let fx = x + w + gap;
+  const fillPlacements = fills.map(f => {
+    const p = { item: f.item, x: fx, y, w: f.w, h: f.h };
+    fx += f.w + gap;
+    return p;
+  });
+  return { main, fills: fillPlacements };
+}
+
+// ---------- side-fill: pack free neighbors into the gutter beside a pin ----------
+// A manually pinned photo always keeps the exact size you gave it — that's
+// the whole point of pinning — so it gets its own dedicated row and nothing
+// resizes it. But a dedicated row only using, say, 40% of the page width
+// left the other 60% blank, which is what forced the repetitive "shrink
+// something else to fill the gap, which makes it unreadable, which makes
+// you pin THAT too" loop. This doesn't touch the pinned photo's size at
+// all; it just looks at photos still in the page's free pool and, if any of
+// them already fit the leftover width at the pin's exact row height with no
+// resizing of their own, sits them in the gutter instead of leaving it
+// blank. If nothing fits as-is, the gutter is simply left blank rather than
+// forcing a fit — this never shrinks or stretches anyone to make room.
+const SIDE_FILL_MIN_GUTTER_FRAC = 0.12; // ignore small gutters — not worth the complexity/gaps
+function applySideFill(pages) {
+  for (const page of pages) {
+    for (const it of page.constrained) it.sideFills = null;
+  }
+  for (const page of pages) {
+    for (const it of page.constrained) {
+      if (!it.manualPin) continue; // scoped to manual pins — the thing users are complaining about
+      const od = orientedDims(it);
+      const h = Math.min(it.constraintHeightPx, PAGE_H);
+      const w = od.w * (h / od.h);
+      if (w > PAGE_W) continue; // already fills the row, no gutter to fill
+      let gutter = PAGE_W - w;
+      if (gutter < PAGE_W * SIDE_FILL_MIN_GUTTER_FRAC) continue;
+      const fills = [];
+      let i = 0;
+      while (i < page.free.length && gutter > PAGE_W * SIDE_FILL_MIN_GUTTER_FRAC * 0.4) {
+        const f = page.free[i];
+        if (f.constraintHeightPx) { i++; continue; } // only genuinely free (unconstrained) photos
+        const fod = orientedDims(f);
+        const naturalW = fod.w * (h / fod.h);
+        if (naturalW <= gutter - (fills.length ? 24 : 0) + 0.5) {
+          fills.push({ item: f, w: naturalW, h });
+          gutter -= naturalW + 24;
+          page.free.splice(i, 1);
+        } else {
+          i++;
+        }
+      }
+      if (fills.length) it.sideFills = fills;
+    }
+  }
 }
 
 // ---------- OCR (worker pool, sparse-text mode, robust size stats) ----------
@@ -1054,9 +1167,16 @@ async function renderPageToCanvas(page) {
   for (const item of page.constrained) {
     let bmp = item.prepared ? item.bitmap : await loadCappedBitmap(item.url);
     if (SUPPORTS_OFFSCREEN) bmp = await normalizeToBitmap(bmp);
-    const { x, y: gy, w, h } = constrainedGeometry(item, y);
+    const geo = constrainedGeometry(item, y);
+    const { x, y: gy, w, h } = geo.main;
     ops.push({ bitmap: bmp, x, y: gy, w, h, rotated: !!item.rotated });
     if (item.file) placements.push({ item, x, y: gy, w, h });
+    for (const fp of geo.fills) {
+      let fbmp = await loadCappedBitmap(fp.item.url);
+      if (SUPPORTS_OFFSCREEN) fbmp = await normalizeToBitmap(fbmp);
+      ops.push({ bitmap: fbmp, x: fp.x, y: fp.y, w: fp.w, h: fp.h, rotated: false });
+      if (fp.item.file) placements.push({ item: fp.item, x: fp.x, y: fp.y, w: fp.w, h: fp.h });
+    }
     y += h;
   }
   if (page.free.length) {
@@ -1086,8 +1206,7 @@ async function renderPageToCanvas(page) {
       { type: 'compose', width: PAGE_W, height: PAGE_H, background: 'white', ops, quality: 0.92 },
       transferables
     );
-    const dataUrl = await blobToDataURL(blob);
-    return { dataUrl, placements };
+    return { blob, placements };
   }
 
   // Main-thread fallback for browsers without OffscreenCanvas/Worker support.
@@ -1107,26 +1226,53 @@ async function renderPageToCanvas(page) {
     }
     releaseBitmap(op.bitmap);
   }
-  return { dataUrl: canvas.toDataURL('image/jpeg', 0.92), placements };
+  const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.92));
+  // Free the full-resolution canvas backing store immediately — we only
+  // needed it to produce the blob.
+  canvas.width = 0; canvas.height = 0;
+  return { blob, placements };
 }
 
+// Preview canvases used to be allocated at full print resolution (2480x3508
+// per page) even though they only ever display at ~200px tall — a canvas's
+// backing store is uncompressed RGBA, so that was ~35MB of GPU/CPU memory
+// PER PAGE just sitting in the DOM. At 600+ photos (dozens of pages) that
+// alone was gigabytes, which is almost certainly the "HUGE memory issue"
+// this app was hitting. Canvases are now sized to actual display resolution
+// (capped devicePixelRatio), which cuts preview memory by roughly two
+// orders of magnitude. Click hit-testing still maps through to full-page
+// placement coordinates via a stored scale factor, so pinning accuracy is
+// unaffected.
+const PREVIEW_DISPLAY_H = 200;
+const PREVIEW_MAX_DPR = 2; // don't bother going sharper than 2x — wasted memory past this
 function renderInteractivePreviews() {
+  releaseAllPreviewImages();
   pagePreviews.innerHTML = '';
   livePageRenders.forEach((pr, pIdx) => {
     const wrap = document.createElement('div');
     wrap.className = 'page-preview-wrap';
     const canvas = document.createElement('canvas');
     const img = new Image();
+    previewImages.push(img);
     img.onload = () => {
-      const dispH = 200, dispW = dispH * (img.width / img.height);
-      canvas.width = img.width; canvas.height = img.height;
+      const dpr = Math.min(window.devicePixelRatio || 1, PREVIEW_MAX_DPR);
+      const dispH = PREVIEW_DISPLAY_H, dispW = dispH * (img.width / img.height);
+      canvas.width = Math.max(1, Math.round(dispW * dpr));
+      canvas.height = Math.max(1, Math.round(dispH * dpr));
       canvas.style.width = dispW + 'px'; canvas.style.height = dispH + 'px';
-      canvas.getContext('2d').drawImage(img, 0, 0);
+      canvas.getContext('2d').drawImage(img, 0, 0, canvas.width, canvas.height);
+      // The full-resolution decoded image is only needed for that one draw
+      // call above — drop the reference immediately so it's eligible for GC
+      // instead of lingering for the rest of the session.
+      img.onload = null; img.src = '';
     };
-    img.src = pr.dataUrl;
+    img.src = pr.objectUrl;
     canvas.addEventListener('click', (e) => {
       const rect = canvas.getBoundingClientRect();
-      const scaleX = canvas.width / rect.width, scaleY = canvas.height / rect.height;
+      // Placements are in full-page pixel space; the canvas backing store is
+      // now display-resolution, so map through the CSS rect (not canvas.width)
+      // to land on the right full-page coordinates.
+      const scaleX = PAGE_W / rect.width, scaleY = PAGE_H / rect.height;
       const px = (e.clientX - rect.left) * scaleX, py = (e.clientY - rect.top) * scaleY;
       const hit = pr.placements.find(p => px >= p.x && px <= p.x + p.w && py >= p.y && py <= p.y + p.h);
       if (hit) openEditPopover(hit.item, hit);
@@ -1136,6 +1282,11 @@ function renderInteractivePreviews() {
     wrap.appendChild(canvas); wrap.appendChild(num);
     pagePreviews.appendChild(wrap);
   });
+}
+let previewImages = [];
+function releaseAllPreviewImages() {
+  for (const img of previewImages) { img.onload = null; img.src = ''; }
+  previewImages = [];
 }
 
 function updateEditPctSliderVisibility() {
@@ -1153,13 +1304,39 @@ function openEditPopover(item, placement) {
   editAxis.value = 'h'; editValue.value = (placement.h / DPI).toFixed(2); editUnit.value = 'in';
   updateEditPctSliderVisibility();
   editUnpinBtn.style.display = item.manualPin ? 'block' : 'none';
+  editAutoRotate.checked = !!item.rotated;
   editPopover.classList.add('open');
+}
+// Row width for a given target size, in either orientation — used to let a
+// pin optionally choose whichever orientation leaves less blank gutter
+// beside it, instead of always keeping the un-rotated width no matter how
+// narrow that leaves the dedicated row.
+function pinGeometryForOrientation(item, axis, px, rotated) {
+  const od = rotated ? { w: item.h, h: item.w } : { w: item.w, h: item.h };
+  let h, w;
+  if (axis === 'h') { h = Math.min(px, PAGE_H); w = od.w * (h / od.h); }
+  else { w = px; h = Math.min(w * (od.h / od.w), PAGE_H); w = od.w * (h / od.h); }
+  if (w > PAGE_W) { const s = PAGE_W / w; w = PAGE_W; h *= s; }
+  return { h, w };
 }
 editPinBtn.addEventListener('click', async () => {
   if (!selectedEditItem) return;
   const px = unitToPx(parseFloat(editValue.value) || 0, editUnit.value, editAxis.value);
-  selectedEditItem.constraintHeightPx = Math.min(editAxis.value === 'h' ? px : px * (selectedEditItem.h / selectedEditItem.w), PAGE_H);
-  selectedEditItem.rotated = false; // manual pin always wins outright — no leftover auto-rotation
+  const axis = editAxis.value;
+  let rotated = false, geo;
+  if (editAutoRotate.checked) {
+    const straight = pinGeometryForOrientation(selectedEditItem, axis, px, false);
+    const turned = pinGeometryForOrientation(selectedEditItem, axis, px, true);
+    // Whichever orientation fills more of the page width leaves the
+    // smaller blank gutter beside it — that's the whole goal here. Your
+    // requested size (the axis you actually typed) is honored exactly
+    // either way; only the resulting shape differs.
+    if (turned.w > straight.w) { rotated = true; geo = turned; } else { geo = straight; }
+  } else {
+    geo = pinGeometryForOrientation(selectedEditItem, axis, px, false);
+  }
+  selectedEditItem.constraintHeightPx = geo.h;
+  selectedEditItem.rotated = rotated;
   selectedEditItem.locked = true;
   selectedEditItem.manualPin = true;
   editPopover.classList.remove('open');
@@ -1176,16 +1353,55 @@ editUnpinBtn.addEventListener('click', async () => {
   await relayoutAndRerender();
 });
 
+// A page's visual result is fully determined by its constrained items (with
+// their heights/rotation/side-fills) and its free items (with the same
+// underlying justified-layout inputs) — so two pages with an identical
+// signature will render identically. Pinning one photo only changes that
+// photo's page (and possibly later pages, if pagination boundaries shift)
+// — earlier, unaffected pages don't need to be re-decoded and re-composed
+// at all. Previously every relayout re-rendered ALL pages from scratch,
+// which meant re-fetching and re-decoding every single photo in the whole
+// document each time you pinned one thing — the "so repetitive" slowness
+// the constant reflowing caused, and needless memory churn on top of it.
+function pageSignature(page) {
+  const c = page.constrained.map(it =>
+    `${it.__id ?? it.name}:${Math.round(it.constraintHeightPx)}:${it.rotated ? 1 : 0}:${(it.sideFills || []).map(f => f.item.__id).join(',')}`
+  ).join('|');
+  const f = page.free.map(it => it.__id).join(',');
+  const s = page.splitFill ? `${Math.round(page.splitFill.w)}x${Math.round(page.splitFill.h)}` : '';
+  return c + '#' + f + '#' + s;
+}
+
 async function relayoutAndRerender() {
   setStatus('Re-laying out around your edit...', 'running');
   progressOuter.style.display = 'block'; progressInner.style.width = '0%';
   closeReadabilityCheck(); // old issue markers reference placements that no longer exist once we re-layout
-  livePages = resolveSizeConstraints(liveItems, liveConfig.target, liveConfig.overflow);
-  livePageRenders = [];
-  for (let i = 0; i < livePages.length; i++) {
-    livePageRenders.push(await renderPageToCanvas(livePages[i]));
-    progressInner.style.width = `${Math.round(((i + 1) / livePages.length) * 100)}%`;
+
+  const oldPages = livePages, oldRenders = livePageRenders;
+  const newPages = resolveSizeConstraints(liveItems, liveConfig.target, liveConfig.overflow);
+  applySideFill(newPages);
+  if (liveConfig.split) await applySplit(newPages);
+
+  const newRenders = [];
+  const reused = new Set();
+  for (let i = 0; i < newPages.length; i++) {
+    const sameAsBefore = oldPages[i] && oldRenders[i] && pageSignature(newPages[i]) === pageSignature(oldPages[i]);
+    if (sameAsBefore) {
+      newRenders.push(oldRenders[i]);
+      reused.add(oldRenders[i]);
+    } else {
+      newRenders.push(finalizePageRender(await renderPageToCanvas(newPages[i])));
+    }
+    progressInner.style.width = `${Math.round(((i + 1) / newPages.length) * 100)}%`;
   }
+  // Release every old render that didn't make it into the new set —
+  // otherwise their object URLs (and the blobs behind them) leak silently
+  // on every single edit, which is exactly the kind of thing that turns
+  // into a "huge memory issue" after hours of pinning and re-pinning.
+  for (const pr of oldRenders) if (!reused.has(pr)) releasePageRender(pr);
+
+  livePages = newPages;
+  livePageRenders = newRenders;
   renderInteractivePreviews();
   setStatus(`Re-laid out — ${livePages.length} page(s). Export when you're happy with it.`, 'done');
   exportBtn.style.display = 'block';
@@ -1302,13 +1518,24 @@ document.addEventListener('keydown', (e) => {
   else if (e.key === 'Escape') { closeReadabilityCheck(); }
 });
 
+// Page renders are kept as Blobs (see finalizePageRender) rather than
+// permanent base64 strings, so the dataURL jsPDF needs is only built here,
+// one page at a time, right when a PDF is actually being produced.
+async function buildAndSavePdf(pageRenders) {
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF({ unit: 'pt', format: 'a4' });
+  for (let i = 0; i < pageRenders.length; i++) {
+    const dataUrl = await blobToDataURL(pageRenders[i].blob);
+    if (i > 0) doc.addPage('a4', 'portrait');
+    doc.addImage(dataUrl, 'JPEG', 0, 0, 595.28, 841.89);
+  }
+  doc.save('optimized_print.pdf');
+}
+
 exportBtn.addEventListener('click', async () => {
   if (!livePageRenders.length) return;
   setStatus('Building PDF...', 'running');
-  const { jsPDF } = window.jspdf;
-  const doc = new jsPDF({ unit: 'pt', format: 'a4' });
-  livePageRenders.forEach((pr, i) => { if (i > 0) doc.addPage('a4', 'portrait'); doc.addImage(pr.dataUrl, 'JPEG', 0, 0, 595.28, 841.89); });
-  doc.save('optimized_print.pdf');
+  await buildAndSavePdf(livePageRenders);
   setStatus(`Exported ${livePageRenders.length} page(s).`, 'done');
 });
 
@@ -1349,9 +1576,10 @@ compileBtn.addEventListener('click', async () => {
       await new Promise(r => setTimeout(r, 0));
       const bmp = await loadCappedBitmap(f.url);
       items.push({
+        __id: i,
         w: bmp.width, h: bmp.height, url: f.url, file: f.file, settings: f.settings, name: f.file.name,
         constraintHeightPx: null, maxConstraintHeightPx: null, globalMinHeightPx: null, globalMaxHeightPx: null,
-        hasText: false, locked: false, manualPin: false, rotated: false,
+        hasText: false, locked: false, manualPin: false, rotated: false, sideFills: null,
       });
       releaseBitmap(bmp);
     }
@@ -1462,45 +1690,32 @@ compileBtn.addEventListener('click', async () => {
     // 5. Paginate (includes size-constraint iterative promotion — pure geometry).
     let pages = resolveSizeConstraints(items, effectiveTarget, overflow);
 
+    // 5b. Pack free neighbors into the gutter beside any manually-pinned
+    // row (there won't be any manual pins yet on a fresh compile, but this
+    // keeps the same pipeline as relayoutAndRerender).
+    applySideFill(pages);
+
     // 6. Priority 3 — split.
-    if (useSplit) {
-      for (let p = 0; p < pages.length - 1; p++) {
-        const page = pages[p], nextPage = pages[p + 1];
-        const usedY = page.constrained.reduce((s, it) => s + Math.min(it.constraintHeightPx, PAGE_H), 0);
-        const { height: freeH } = layoutFreeItems(page.free, PAGE_H - usedY, usedY);
-        const leftover = PAGE_H - usedY - freeH;
-        if (leftover < SPLIT_MIN_GAP_PX) continue;
-        const idx = nextPage.free.findIndex(it => !it.locked && !it.hasText);
-        if (idx < 0) continue;
-        const [victim] = nextPage.free.splice(idx, 1);
-        setStatus(`Preparing puzzle split for "${victim.name}"...`, 'running');
-        await new Promise(r => setTimeout(r, 0));
-        const victimBmp = await loadCappedBitmap(victim.url);
-        const { pieceA, pieceB } = planSplit(victimBmp, victim.w, victim.h, leftover);
-        releaseBitmap(victimBmp);
-        page.splitFill = { bitmap: pieceA.bitmap, w: pieceA.w, h: pieceA.h, y: usedY + freeH };
-        if (pieceB) nextPage.constrained.unshift({ constraintHeightPx: pieceB.h, w: pieceB.w, h: pieceB.h, bitmap: pieceB.bitmap, prepared: true });
-      }
-    }
+    if (useSplit) await applySplit(pages);
 
     // 7. Render pages, one at a time, storing placements for interactivity.
+    releaseAllPageRenders(livePageRenders); // drop any previous compile's page renders
     const pageRenders = [];
     for (let p = 0; p < pages.length; p++) {
       setStatus(`Compiling page ${p + 1} of ${pages.length}...`, 'running');
       await new Promise(r => setTimeout(r, 0));
-      pageRenders.push(await renderPageToCanvas(pages[p]));
+      pageRenders.push(finalizePageRender(await renderPageToCanvas(pages[p])));
       progressInner.style.width = `${Math.round(((p + 1) / pages.length) * 100)}%`;
     }
 
-    liveItems = items; livePages = pages; liveConfig = { target: effectiveTarget, overflow }; livePageRenders = pageRenders;
+    liveItems = items; livePages = pages;
+    liveConfig = { target: effectiveTarget, overflow, split: useSplit };
+    livePageRenders = pageRenders;
     renderInteractivePreviews();
     exportBtn.style.display = 'block';
     checkReadabilityBtn.style.display = 'block';
 
-    const { jsPDF } = window.jspdf;
-    const doc = new jsPDF({ unit: 'pt', format: 'a4' });
-    pageRenders.forEach((pr, i) => { if (i > 0) doc.addPage('a4', 'portrait'); doc.addImage(pr.dataUrl, 'JPEG', 0, 0, 595.28, 841.89); });
-    doc.save('optimized_print.pdf');
+    await buildAndSavePdf(pageRenders);
 
     progressInner.style.width = '100%';
     let msg = `Done — ${pages.length} page(s) compiled and downloaded. Tap any photo above to pin its size and re-export.`;
