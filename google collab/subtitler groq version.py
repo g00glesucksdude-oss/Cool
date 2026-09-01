@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import time
 from pydub import AudioSegment
 from pydub.silence import detect_silence
 from groq import Groq
@@ -15,6 +16,7 @@ SEARCH_WINDOW_MS = 30 * 1000         # look +/- 30s around target for a quiet sp
 MIN_SILENCE_LEN = 400                # ms of quiet to count as a "gap"
 SILENCE_THRESH_OFFSET = -16          # dB below the chunk's average loudness
 MAX_CHUNK_BYTES = 24 * 1024 * 1024   # hard safety ceiling, 1MB headroom under Groq's 25MB limit
+RATE_LIMIT_COOLDOWN_SEC = 3          # pause before retrying after a 429, so we don't hammer the API
 
 
 # --- API KEY MANAGEMENT ---
@@ -251,6 +253,9 @@ def transcribe_file(api_keys: list, file_path: str):
             except Exception as e:
                 if is_quota_or_rate_limit_error(e):
                     print(f"[!] Key '{key_index+1}' hit a rate limit/quota error: {e}")
+                    print(f"[+] Waiting {RATE_LIMIT_COOLDOWN_SEC}s before retrying, to avoid a cycling error...")
+                    time.sleep(RATE_LIMIT_COOLDOWN_SEC)
+
                     key_index += 1
                     if key_index >= len(api_keys):
                         if os.path.exists(chunk_name):
@@ -300,3 +305,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+ 
