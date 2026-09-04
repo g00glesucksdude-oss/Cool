@@ -1,23 +1,34 @@
 import os
 import re
+import zipfile
 
 TRANSCRIPTS_DIR = "/content/drive/MyDrive/Transcripts/transcripts"
+ZIP_PATH = os.path.join(TRANSCRIPTS_DIR, "srt_files.zip")
 
 def seconds_to_srt(t):
     hours = int(t // 3600)
     minutes = int((t % 3600) // 60)
     seconds = int(t % 60)
     millis = int(round((t - int(t)) * 1000))
+    if millis == 1000:  # handle rounding overflow
+        millis = 0
+        seconds += 1
+        if seconds == 60:
+            seconds = 0
+            minutes += 1
+            if minutes == 60:
+                minutes = 0
+                hours += 1
     return f"{hours:02d}:{minutes:02d}:{seconds:02d},{millis:03d}"
 
 def convert_txt_to_srt(txt_path):
     srt_path = os.path.splitext(txt_path)[0] + ".srt"
-    
+
     pattern = re.compile(r"\[(\d+\.?\d*)s\s*->\s*(\d+\.?\d*)s\]\s*(.*)")
-    
+
     with open(txt_path, "r", encoding="utf-8") as f:
         lines = f.readlines()
-    
+
     blocks = []
     for line in lines:
         m = pattern.match(line.strip())
@@ -27,20 +38,37 @@ def convert_txt_to_srt(txt_path):
             text = m.group(3).strip()
             if text:
                 blocks.append((start, end, text))
-    
+
     with open(srt_path, "w", encoding="utf-8") as f:
         for i, (start, end, text) in enumerate(blocks, 1):
             f.write(f"{i}\n")
             f.write(f"{seconds_to_srt(start)} --> {seconds_to_srt(end)}\n")
             f.write(f"{text}\n\n")
-    
+
     print(f"[OK] {os.path.basename(txt_path)} → {os.path.basename(srt_path)}")
+    return srt_path
 
 # Convert every .txt
 converted = 0
+srt_files = []
 for fname in os.listdir(TRANSCRIPTS_DIR):
     if fname.endswith(".txt"):
-        convert_txt_to_srt(os.path.join(TRANSCRIPTS_DIR, fname))
+        srt_path = convert_txt_to_srt(os.path.join(TRANSCRIPTS_DIR, fname))
+        srt_files.append(srt_path)
         converted += 1
 
 print(f"\nDone. Converted {converted} file(s).")
+
+# Zip all .srt files
+if srt_files:
+    with zipfile.ZipFile(ZIP_PATH, "w", zipfile.ZIP_DEFLATED) as zf:
+        for srt_path in srt_files:
+            zf.write(srt_path, arcname=os.path.basename(srt_path))
+    print(f"[OK] Zipped {len(srt_files)} .srt file(s) → {ZIP_PATH}")
+
+    # Remove the loose .srt files
+    for srt_path in srt_files:
+        os.remove(srt_path)
+    print("[OK] Cleared loose .srt files.")
+else:
+    print("No .srt files were created, skipping zip step.")
