@@ -1,0 +1,46 @@
+import os
+import re
+
+TRANSCRIPTS_DIR = "/content/drive/MyDrive/Transcripts/transcripts"
+
+def seconds_to_srt(t):
+    hours = int(t // 3600)
+    minutes = int((t % 3600) // 60)
+    seconds = int(t % 60)
+    millis = int(round((t - int(t)) * 1000))
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d},{millis:03d}"
+
+def convert_txt_to_srt(txt_path):
+    srt_path = os.path.splitext(txt_path)[0] + ".srt"
+    
+    pattern = re.compile(r"\[(\d+\.?\d*)s\s*->\s*(\d+\.?\d*)s\]\s*(.*)")
+    
+    with open(txt_path, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+    
+    blocks = []
+    for line in lines:
+        m = pattern.match(line.strip())
+        if m:
+            start = float(m.group(1))
+            end = float(m.group(2))
+            text = m.group(3).strip()
+            if text:
+                blocks.append((start, end, text))
+    
+    with open(srt_path, "w", encoding="utf-8") as f:
+        for i, (start, end, text) in enumerate(blocks, 1):
+            f.write(f"{i}\n")
+            f.write(f"{seconds_to_srt(start)} --> {seconds_to_srt(end)}\n")
+            f.write(f"{text}\n\n")
+    
+    print(f"[OK] {os.path.basename(txt_path)} → {os.path.basename(srt_path)}")
+
+# Convert every .txt
+converted = 0
+for fname in os.listdir(TRANSCRIPTS_DIR):
+    if fname.endswith(".txt"):
+        convert_txt_to_srt(os.path.join(TRANSCRIPTS_DIR, fname))
+        converted += 1
+
+print(f"\nDone. Converted {converted} file(s).")
