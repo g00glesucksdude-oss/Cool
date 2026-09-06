@@ -3,7 +3,7 @@ import subprocess
 import sys
 
 print("[+] Checking and installing dependencies...")
-reqs = ["faster-whisper", "deep-translator"]
+reqs = ["faster-whisper", "pydub", "fasttext-wheel"]
 subprocess.check_call([sys.executable, "-m", "pip", "install", "-q"] + reqs)
 
 # --- 2. IMPORTS ---
@@ -16,8 +16,11 @@ import shutil
 import http.cookiejar
 import urllib.request
 from urllib.parse import urlsplit, urlunsplit, quote, urlparse, parse_qs
+from datetime import datetime
 import torch
 from google.colab import drive
+from pydub import AudioSegment
+from pydub.silence import detect_silence
 
 # --- MOUNT DRIVE ---
 drive_mount_path = "/content/drive"
@@ -28,12 +31,31 @@ if not os.path.exists(drive_mount_path):
 DRIVE_SAVE_DIR = "/content/drive/MyDrive/Transcripts"
 TRANSCRIPTS_DIR = os.path.join(DRIVE_SAVE_DIR, "transcripts")
 STATE_FILE = os.path.join(DRIVE_SAVE_DIR, "batch_state.json")
+CRASH_LOG = os.path.join(DRIVE_SAVE_DIR, "crash.log")  # on Drive - local Colab disk dies on disconnect
 DOWNLOAD_PATH = "downloaded_input"
 EXTRACT_DIR = "batch_audio"
 AUDIO_EXTS = (".ogg", ".oga", ".mp3", ".wav", ".m4a", ".flac")
-TRANSLATE_CHUNK_CHARS = 4500  # stay under free-tier translation API limits per request
 os.makedirs(TRANSCRIPTS_DIR, exist_ok=True)
 os.makedirs(EXTRACT_DIR, exist_ok=True)
+
+# --- CHUNKING (independent language detection per chunk, not just once per file) ---
+TARGET_CHUNK_MS = 10 * 60 * 1000     # ~10 min macro-chunks; GPU has no per-request size cap like Groq does
+SEARCH_WINDOW_MS = 30 * 1000         # look +/- 30s around target for a quiet spot to cut
+MIN_SILENCE_LEN = 400                # ms of quiet to count as a "gap"
+SILENCE_THRESH_OFFSET = -16          # dB below the chunk's average loudness
+
+# --- DOUBLE-CHECK / CONFIDENCE THRESHOLDS (same defaults Whisper uses internally) ---
+LOGPROB_THRESHOLD = -1.0
+NO_SPEECH_THRESHOLD = 0.6
+COMPRESSION_RATIO_THRESHOLD = 2.4
+LANG_MISMATCH_CONFIDENCE = 0.6
+RETRY_TEMPERATURES = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]  # faster-whisper escalates through these itself
+RETRY_BEAM_SIZE = 5                  # only used for the flagged-segment retry pass, base pass stays beam_size=1 for speed
+
+# fastText model lives on Drive so it survives across Colab sessions (~126MB, only downloaded once ever)
+LID_MODEL_PATH = os.path.join(DRIVE_SAVE_DIR, "lid.176.bin")
+LID_MODEL_URL = "https://dl.fbaipublicfiles.com/fasttext/supervised-models/lid.176.bin"
+_lid_model = None
 
 # --- STATE HELPERS ---
 def load_state():
@@ -45,6 +67,162 @@ def load_state():
 def save_state(state):
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f)
+
+# --- TIMESTAMP HELPERS (for manual resume-point override + crash.log) ---
+def format_hms(seconds: float) -> str:
+    seconds = max(0, int(round(seconds)))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}"
+
+
+def parse_hms(raw: str):
+    """Parses 'H:M:S', 'M:S', or plain seconds. Returns seconds (float) or None if invalid."""
+    raw = raw.strip()
+    if not raw:
+        return None
+    parts = raw.split(":")
+    try:
+        parts = [float(p) for p in parts]
+    except ValueError:
+        return None
+    if len(parts) == 1:
+        h, m, s = 0.0, 0.0, parts[0]
+    elif len(parts) == 2:
+        h, m, s = 0.0, parts[0], parts[1]
+    elif len(parts) == 3:
+        h, m, s = parts
+    else:
+        return None
+    if m >= 60 or s >= 60 or h < 0 or m < 0 or s < 0:
+        return None
+    return h * 3600 + m * 60 + s
+
+
+def log_crash(fname: str, position_sec: float, reason: str):
+    """Appends to crash.log on Drive - the Groq script reads this the same way
+    you do: as a plain HH:MM:SS to paste in as a manual resume point."""
+    line = (f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] '{fname}' stopped at "
+            f"{format_hms(position_sec)} ({position_sec:.2f}s) - {reason}\n")
+    with open(CRASH_LOG, "a", encoding="utf-8") as f:
+        f.write(line)
+    print(f"[+] Logged to crash.log (Drive): stopped at {format_hms(position_sec)}")
+
+# --- CHUNK BOUNDARIES (cut on silence so we don't split mid-word) ---
+def find_cut_point(audio: AudioSegment, target_ms: int) -> int:
+    window_start = max(0, target_ms - SEARCH_WINDOW_MS)
+    window_end = min(len(audio), target_ms + SEARCH_WINDOW_MS)
+    window = audio[window_start:window_end]
+
+    thresh = window.dBFS + SILENCE_THRESH_OFFSET
+    silences = detect_silence(window, min_silence_len=MIN_SILENCE_LEN, silence_thresh=thresh)
+    if not silences:
+        return target_ms
+
+    best = min(silences, key=lambda s: abs((window_start + (s[0] + s[1]) // 2) - target_ms))
+    return window_start + (best[0] + best[1]) // 2
+
+
+def build_chunks(audio: AudioSegment) -> list:
+    chunks = []
+    pos = 0
+    while pos < len(audio):
+        target_end = min(pos + TARGET_CHUNK_MS, len(audio))
+        if target_end < len(audio):
+            target_end = find_cut_point(audio, target_end)
+        chunks.append((pos, target_end))
+        pos = target_end
+    return chunks
+
+
+# --- DOUBLE-CHECKER: confidence + language-mismatch flagging ---
+def _get_lid_model():
+    """Lazy-load the fastText language-ID model. Returns None if unavailable,
+    in which case the language-mismatch check is silently skipped."""
+    global _lid_model
+    if _lid_model is not None:
+        return _lid_model
+    try:
+        import fasttext
+    except ImportError:
+        print("[!] fasttext not installed - language-mismatch double-checking is disabled.")
+        return None
+
+    if not os.path.exists(LID_MODEL_PATH):
+        print("[+] Downloading fastText language-ID model to Drive (~126MB, one-time only)...")
+        urllib.request.urlretrieve(LID_MODEL_URL, LID_MODEL_PATH)
+
+    fasttext.FastText.eprint = lambda *a, **k: None  # silence a harmless load warning
+    _lid_model = fasttext.load_model(LID_MODEL_PATH)
+    return _lid_model
+
+
+def detect_text_language(text: str):
+    model = _get_lid_model()
+    if model is None or not text.strip():
+        return None, 0.0
+    clean = " ".join(text.strip().split())
+    labels, probs = model.predict(clean, k=1)
+    return labels[0].replace("__label__", ""), float(probs[0])
+
+
+def flag_segments(segments: list, expected_lang: str) -> list:
+    """segments here are faster-whisper Segment objects (attrs, not dicts)."""
+    flags = []
+    for seg in segments:
+        reasons = []
+        if seg.avg_logprob < LOGPROB_THRESHOLD:
+            reasons.append(f"low avg_logprob ({seg.avg_logprob:.2f})")
+        if seg.no_speech_prob > NO_SPEECH_THRESHOLD:
+            reasons.append(f"high no_speech_prob ({seg.no_speech_prob:.2f})")
+        if seg.compression_ratio > COMPRESSION_RATIO_THRESHOLD:
+            reasons.append(f"high compression_ratio ({seg.compression_ratio:.2f}, possible repetition loop)")
+
+        seg_lang, seg_conf = detect_text_language(seg.text)
+        if seg_lang and expected_lang and seg_lang != expected_lang and seg_conf > LANG_MISMATCH_CONFIDENCE:
+            reasons.append(
+                f"language mismatch (chunk detected as '{expected_lang}', "
+                f"this segment reads like '{seg_lang}' at {seg_conf:.2f} confidence)"
+            )
+
+        if reasons:
+            flags.append({"start": seg.start, "end": seg.end, "text": seg.text, "reasons": reasons})
+    return flags
+
+
+def retry_flagged_segment(model, chunk_audio: AudioSegment, seg_start_ms: int, seg_end_ms: int):
+    """Re-runs just the flagged span with a higher beam size and Whisper's own
+    temperature-escalation list, and returns (text, avg_logprob) for the best result."""
+    pad = 300  # small padding so we don't clip the start/end of the word
+    s = max(0, seg_start_ms - pad)
+    e = min(len(chunk_audio), seg_end_ms + pad)
+    tmp_path = os.path.join(EXTRACT_DIR, "temp_retry_segment.wav")
+    chunk_audio[s:e].export(tmp_path, format="wav")
+    try:
+        retry_segments, _ = model.transcribe(
+            tmp_path, language=None, beam_size=RETRY_BEAM_SIZE, temperature=RETRY_TEMPERATURES
+        )
+        retry_segments = list(retry_segments)
+        if not retry_segments:
+            return None, None
+        text = " ".join(s.text.strip() for s in retry_segments).strip()
+        avg_logprob = sum(s.avg_logprob for s in retry_segments) / len(retry_segments)
+        return text, avg_logprob
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
+def flags_path(out_path: str) -> str:
+    base = os.path.splitext(out_path)[0]
+    return f"{base}.flags.json"
+
+
+def save_flags(out_path: str, flags_by_chunk: dict):
+    if not flags_by_chunk:
+        return
+    with open(flags_path(out_path), "w", encoding="utf-8") as f:
+        json.dump(flags_by_chunk, f, indent=2)
 
 # --- URL HELPERS ---
 def safe_encode_url(url):
@@ -156,72 +334,7 @@ def download_link(url, dest):
             f_out.write(resp.read())
     return suggested_name
 
-# --- TRANSLATION ---
-def chunk_text_for_translation(text, max_chars=TRANSLATE_CHUNK_CHARS):
-    if len(text) <= max_chars:
-        return [text]
-    lines = text.split("\n")
-    chunks, current = [], ""
-    for line in lines:
-        candidate = (current + "\n" + line) if current else line
-        if len(candidate) <= max_chars:
-            current = candidate
-        else:
-            if current:
-                chunks.append(current)
-            current = line if len(line) <= max_chars else line[:max_chars]
-    if current:
-        chunks.append(current)
-    return chunks
-
-def translate_transcript_file(src_path, dest_path, target_lang):
-    """Translate only the spoken text on each '[start -> end] text' line,
-    keeping the timestamps intact, and write to a separate file."""
-    from deep_translator import GoogleTranslator
-    translator = GoogleTranslator(source="auto", target=target_lang)
-    line_pattern = re.compile(r"^(\[[0-9]+\.[0-9]+s -> [0-9]+\.[0-9]+s\] )(.*)$")
-
-    with open(src_path, "r", encoding="utf-8") as f:
-        raw_lines = [l.rstrip("\n") for l in f if l.strip()]
-
-    prefixes, texts = [], []
-    for line in raw_lines:
-        m = line_pattern.match(line)
-        if m:
-            prefixes.append(m.group(1))
-            texts.append(m.group(2))
-        else:
-            prefixes.append("")
-            texts.append(line)
-
-    joined = "\n".join(texts)
-    translated_lines = []
-    for chunk in chunk_text_for_translation(joined):
-        try:
-            result = translator.translate(chunk)
-        except Exception as e:
-            print(f"[!] Translation error on a chunk, leaving it untranslated: {e}")
-            result = chunk
-        translated_lines.extend(result.split("\n"))
-
-    # Guard against the translator merging/splitting lines unexpectedly.
-    if len(translated_lines) != len(prefixes):
-        translated_lines = texts  # fall back to untranslated rather than misaligning
-
-    with open(dest_path, "w", encoding="utf-8") as f_out:
-        for prefix, tline in zip(prefixes, translated_lines):
-            f_out.write(f"{prefix}{tline}\n")
-
-def prompt_translation_choice():
-    raw = input(
-        "\nTranslate finished transcripts too? Enter a target language code "
-        "(e.g. 'es', 'fr', 'ja'), or press Enter to skip: "
-    ).strip()
-    return raw.lower() or None
-
 # --- 3. GET THE LINK AND FIGURE OUT WHAT IT IS ---
-TRANSLATE_LANG = prompt_translation_choice()
-
 link = input("Paste a link to a single audio file (.ogg/.oga/.mp3/.wav/.m4a/.flac) OR a ZIP of multiple files: ").strip()
 suggested_name = download_link(link, DOWNLOAD_PATH)
 
@@ -297,19 +410,30 @@ for audio_path in audio_files:
 
     if entry.get("done"):
         print(f"\n[=] Skipping '{fname}' - already fully transcribed.")
-        if TRANSLATE_LANG:
-            translated_path = os.path.join(TRANSCRIPTS_DIR, os.path.splitext(fname)[0] + f"_{TRANSLATE_LANG}.txt")
-            if not os.path.exists(translated_path):
-                print(f"[+] Translating existing transcript to '{TRANSLATE_LANG}'...")
-                translate_transcript_file(out_path, translated_path, TRANSLATE_LANG)
-                print(f"[OK] Saved translation: {translated_path}")
         continue
 
     resume_offset = float(entry.get("last_end", 0.0))
+    known_offset = resume_offset
+
+    raw = input(
+        f"[?] Resume '{fname}' at {format_hms(known_offset)}? Press Enter to accept, or type a "
+        f"different HH:MM:SS to jump there instead (e.g. wherever the Groq script left off) - "
+        f"or Enter alone for 0:00:00 if this is a fresh file: "
+    ).strip()
+    if raw:
+        override_sec = parse_hms(raw)
+        if override_sec is None:
+            print("[!] Couldn't parse that timestamp - using the default instead.")
+        else:
+            resume_offset = override_sec
+            print(f"[+] Manual override: resuming '{fname}' from {format_hms(resume_offset)}.")
+
     if resume_offset > 0:
-        print(f"\n[+] Resuming '{fname}' from {resume_offset:.2f}s")
+        print(f"\n[+] Continuing '{fname}' from {format_hms(resume_offset)} ({resume_offset:.2f}s)")
+        if not os.path.exists(out_path):
+            open(out_path, "w", encoding="utf-8").close()
     else:
-        print(f"\n[+] Transcribing '{fname}'...")
+        print(f"\n[+] Transcribing '{fname}' from the start...")
         open(out_path, "w", encoding="utf-8").close()  # fresh start for this file
 
     process_path = audio_path
@@ -324,21 +448,78 @@ for audio_path in audio_files:
             check=True, capture_output=True
         )
 
-    segments, info = model.transcribe(process_path, beam_size=1)
-    print(f"[+] Detected language: {info.language} (probability {info.language_probability:.2f})")
+    # Load once and slice into macro-chunks so language gets auto-detected
+    # independently per chunk instead of once for the whole file - otherwise a
+    # language switch mid-recording just gets decoded with the wrong tokens.
+    print("[+] Loading audio for chunking (this can take a bit for long/multi-hour files)...")
+    full_audio = AudioSegment.from_file(process_path)
+    macro_chunks = build_chunks(full_audio)
+    print(f"[+] Split remaining audio into {len(macro_chunks)} macro-chunk(s) "
+          f"(~{TARGET_CHUNK_MS/60000:.0f} min each) for independent language detection.")
 
-    with open(out_path, "a", encoding="utf-8") as f_out:
-        for segment in segments:
-            start, end = segment.start + resume_offset, segment.end + resume_offset
-            line = f"[{start:.2f}s -> {end:.2f}s] {segment.text}\n"
-            f_out.write(line)
-            f_out.flush()
-            os.fsync(f_out.fileno())
-            print(line, end="")
+    all_flags = {}
+    temp_chunk_path = os.path.join(EXTRACT_DIR, "temp_macro_chunk.wav")
 
-            entry["last_end"] = end
-            state[key] = entry
-            save_state(state)
+    try:
+        with open(out_path, "a", encoding="utf-8") as f_out:
+            for c_start_ms, c_end_ms in macro_chunks:
+                chunk_audio = full_audio[c_start_ms:c_end_ms]
+                chunk_audio.export(temp_chunk_path, format="wav")
+
+                segments, info = model.transcribe(temp_chunk_path, language=None, beam_size=1, temperature=0.0)
+                segments = list(segments)
+                print(f"[+] Chunk {c_start_ms/1000:.0f}s-{c_end_ms/1000:.0f}s -> "
+                      f"detected language: {info.language} (probability {info.language_probability:.2f})")
+
+                flags = flag_segments(segments, info.language)
+                resolved_texts = {}  # segment index -> replacement text, for flags we managed to fix
+                if flags:
+                    print(f"[?] {len(flags)} segment(s) look shaky in this chunk - double-checking...")
+                    for idx, segment in enumerate(segments):
+                        if not any(f["start"] == segment.start and f["end"] == segment.end for f in flags):
+                            continue
+                        seg_start_ms = int(segment.start * 1000)
+                        seg_end_ms = int(segment.end * 1000)
+                        retry_text, retry_logprob = retry_flagged_segment(model, chunk_audio, seg_start_ms, seg_end_ms)
+                        if retry_text and retry_logprob is not None and retry_logprob > segment.avg_logprob:
+                            resolved_texts[idx] = retry_text
+                            print(f"    [+] improved segment @ {segment.start:.1f}s "
+                                  f"(avg_logprob {segment.avg_logprob:.2f} -> {retry_logprob:.2f})")
+                        else:
+                            print(f"    [!] segment @ {segment.start:.1f}s still shaky after retry - "
+                                  f"keeping original, flagged for review")
+
+                    # Logged in full (including segments we managed to fix) so there's a record of
+                    # what got flagged and why, even if the retry pass improved it.
+                    all_flags[f"{resume_offset + c_start_ms/1000:.2f}s"] = flags
+                    save_flags(out_path, all_flags)
+
+                for idx, segment in enumerate(segments):
+                    text = resolved_texts.get(idx, segment.text)
+                    start = resume_offset + c_start_ms / 1000 + segment.start
+                    end = resume_offset + c_start_ms / 1000 + segment.end
+                    line = f"[{start:.2f}s -> {end:.2f}s] {text}\n"
+                    f_out.write(line)
+                    print(line, end="")
+                f_out.flush()
+                os.fsync(f_out.fileno())
+
+                entry["last_end"] = resume_offset + c_end_ms / 1000.0
+                state[key] = entry
+                save_state(state)
+    except BaseException as e:
+        # Covers real crashes (CUDA OOM, ffmpeg failures, etc.) as well as a manual
+        # Ctrl+C. A genuine Colab disconnect kills the VM before any of this can run -
+        # in that case entry["last_end"] on Drive (saved after every macro-chunk above)
+        # is itself the record; this is for anything that happens *within* a live session.
+        last_known = entry.get("last_end", resume_offset)
+        reason = "manually interrupted" if isinstance(e, KeyboardInterrupt) else f"error: {e}"
+        log_crash(fname, last_known, f"{reason} ({format_hms(last_known)} was the last saved point)")
+        print(f"\n[STOPPED] '{fname}' stopped. Last saved point: {format_hms(last_known)}.")
+        raise
+    finally:
+        if os.path.exists(temp_chunk_path):
+            os.remove(temp_chunk_path)
 
     entry["done"] = True
     state[key] = entry
@@ -348,12 +529,8 @@ for audio_path in audio_files:
         os.remove(process_path)
 
     print(f"[OK] '{fname}' -> {out_path}")
-
-    if TRANSLATE_LANG:
-        translated_path = os.path.join(TRANSCRIPTS_DIR, os.path.splitext(fname)[0] + f"_{TRANSLATE_LANG}.txt")
-        print(f"[+] Translating transcript to '{TRANSLATE_LANG}'...")
-        translate_transcript_file(out_path, translated_path, TRANSLATE_LANG)
-        print(f"[OK] Saved translation: {translated_path}")
+    if os.path.exists(flags_path(out_path)):
+        print(f"    Note: some segments were flagged for review - see {os.path.basename(flags_path(out_path))}")
 
 # --- 6. CLEANUP: only once every file in the batch is done ---
 all_done = all(state.get(f"{os.path.basename(p)}_{os.path.getsize(p)}", {}).get("done") for p in audio_files)
