@@ -1,0 +1,376 @@
+# --- 1. AUTOMATIC DEPENDENCY INSTALLATION ---
+import subprocess
+import sys
+
+print("[+] Checking and installing dependencies...")
+reqs = ["faster-whisper", "deep-translator"]
+subprocess.check_call([sys.executable, "-m", "pip", "install", "-q"] + reqs)
+
+# --- 2. IMPORTS ---
+import os
+import gc
+import re
+import json
+import zipfile
+import shutil
+import http.cookiejar
+import urllib.request
+from urllib.parse import urlsplit, urlunsplit, quote, urlparse, parse_qs
+import torch
+from google.colab import drive
+
+# --- MOUNT DRIVE ---
+drive_mount_path = "/content/drive"
+if not os.path.exists(drive_mount_path):
+    drive.mount(drive_mount_path)
+
+# --- CONFIGURATION ---
+DRIVE_SAVE_DIR = "/content/drive/MyDrive/Transcripts"
+TRANSCRIPTS_DIR = os.path.join(DRIVE_SAVE_DIR, "transcripts")
+STATE_FILE = os.path.join(DRIVE_SAVE_DIR, "batch_state.json")
+DOWNLOAD_PATH = "downloaded_input"
+EXTRACT_DIR = "batch_audio"
+AUDIO_EXTS = (".ogg", ".oga", ".mp3", ".wav", ".m4a", ".flac")
+TRANSLATE_CHUNK_CHARS = 4500  # stay under free-tier translation API limits per request
+os.makedirs(TRANSCRIPTS_DIR, exist_ok=True)
+os.makedirs(EXTRACT_DIR, exist_ok=True)
+
+# --- STATE HELPERS ---
+def load_state():
+    if os.path.exists(STATE_FILE):
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+def save_state(state):
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f)
+
+# --- URL HELPERS ---
+def safe_encode_url(url):
+    """Percent-encode non-ASCII / unsafe characters (emoji, raw & or +, etc.)."""
+    parts = urlsplit(url)
+    path = quote(parts.path, safe="/%")
+    query = quote(parts.query, safe="=&%")
+    return urlunsplit((parts.scheme, parts.netloc, path, query, parts.fragment))
+
+def guess_filename(url, headers):
+    cd = headers.get("Content-Disposition", "")
+    match = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";\n]+)"?', cd)
+    if match:
+        return match.group(1).strip()
+    return os.path.basename(urlparse(url).path) or "downloaded_file"
+
+# --- MEDIAFIRE ---
+def resolve_mediafire(url):
+    print("[+] Mediafire link detected - resolving direct download URL...")
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req) as resp:
+        html = resp.read().decode("utf-8", errors="ignore")
+
+    # Try a couple of known patterns in case Mediafire tweaks their markup -
+    # this scraping approach is inherently fragile against unannounced UI
+    # changes, so we try more than one shape before giving up.
+    patterns = [
+        r'href="(https?://download[^"]+)"',
+        r'id="downloadButton"[^>]*href="([^"]+)"',
+        r'"downloadUrl"\s*:\s*"([^"]+)"',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, html)
+        if match:
+            return safe_encode_url(match.group(1).replace("\\/", "/"))
+
+    raise ValueError(
+        "Could not find a direct download link on that Mediafire page. "
+        "Mediafire may have changed their page layout - try downloading "
+        "manually and re-hosting on a direct link instead."
+    )
+
+# --- GOOGLE DRIVE (handles the large-file virus-scan confirmation step) ---
+def extract_gdrive_id(url):
+    m = re.search(r"/file/d/([^/]+)", url) or re.search(r"[?&]id=([^&]+)", url)
+    return m.group(1) if m else None
+
+def download_from_gdrive(file_id, dest):
+    cookie_jar = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cookie_jar))
+    base = "https://drive.google.com/uc?export=download"
+
+    resp = opener.open(f"{base}&id={file_id}")
+    content_type = resp.headers.get("Content-Type", "")
+
+    if "text/html" in content_type:
+        html = resp.read().decode("utf-8", errors="ignore")
+        token_match = re.search(r'confirm=([0-9A-Za-z_-]+)', html)
+        uuid_match = re.search(r'name="uuid" value="([^"]+)"', html)
+        if uuid_match:
+            # Newer Drive interstitial page (large files)
+            confirm_match = re.search(r'name="confirm" value="([^"]+)"', html)
+            confirm_val = confirm_match.group(1) if confirm_match else "t"
+            resp = opener.open(
+                f"https://drive.usercontent.google.com/download?id={file_id}"
+                f"&export=download&confirm={confirm_val}&uuid={uuid_match.group(1)}"
+            )
+        elif token_match:
+            resp = opener.open(f"{base}&id={file_id}&confirm={token_match.group(1)}")
+        # else: small file, no confirmation needed - html was probably a real error page
+
+    fname = guess_filename(f"{base}&id={file_id}", resp.headers)
+    content_type = resp.headers.get("Content-Type", "")
+    if "text/html" in content_type:
+        # Still got HTML back after our confirmation attempt - Google's
+        # interstitial page format has changed again, or the file is
+        # private/restricted. This scraping approach can't recover from
+        # that automatically.
+        raise ValueError(
+            "Google Drive returned a webpage instead of the file. This usually "
+            "means the file isn't shared as 'Anyone with the link', or Drive's "
+            "confirmation page format changed. Check sharing settings and retry."
+        )
+
+    with open(dest, "wb") as f_out:
+        f_out.write(resp.read())
+    return fname
+
+# --- MASTER DOWNLOAD DISPATCHER ---
+def download_link(url, dest):
+    url = safe_encode_url(url.strip())
+
+    if "drive.google.com" in url:
+        file_id = extract_gdrive_id(url)
+        if not file_id:
+            raise ValueError("Could not find a file ID in that Google Drive link.")
+        print("[+] Google Drive link detected - resolving direct download...")
+        suggested_name = download_from_gdrive(file_id, dest)
+        return suggested_name
+
+    if "mediafire.com" in url and "/file/" in url:
+        url = resolve_mediafire(url)
+
+    print(f"[+] Downloading from: {url}")
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req) as resp:
+        suggested_name = guess_filename(url, resp.headers)
+        with open(dest, "wb") as f_out:
+            f_out.write(resp.read())
+    return suggested_name
+
+# --- TRANSLATION ---
+def chunk_text_for_translation(text, max_chars=TRANSLATE_CHUNK_CHARS):
+    if len(text) <= max_chars:
+        return [text]
+    lines = text.split("\n")
+    chunks, current = [], ""
+    for line in lines:
+        candidate = (current + "\n" + line) if current else line
+        if len(candidate) <= max_chars:
+            current = candidate
+        else:
+            if current:
+                chunks.append(current)
+            current = line if len(line) <= max_chars else line[:max_chars]
+    if current:
+        chunks.append(current)
+    return chunks
+
+def translate_transcript_file(src_path, dest_path, target_lang):
+    """Translate only the spoken text on each '[start -> end] text' line,
+    keeping the timestamps intact, and write to a separate file."""
+    from deep_translator import GoogleTranslator
+    translator = GoogleTranslator(source="auto", target=target_lang)
+    line_pattern = re.compile(r"^(\[[0-9]+\.[0-9]+s -> [0-9]+\.[0-9]+s\] )(.*)$")
+
+    with open(src_path, "r", encoding="utf-8") as f:
+        raw_lines = [l.rstrip("\n") for l in f if l.strip()]
+
+    prefixes, texts = [], []
+    for line in raw_lines:
+        m = line_pattern.match(line)
+        if m:
+            prefixes.append(m.group(1))
+            texts.append(m.group(2))
+        else:
+            prefixes.append("")
+            texts.append(line)
+
+    joined = "\n".join(texts)
+    translated_lines = []
+    for chunk in chunk_text_for_translation(joined):
+        try:
+            result = translator.translate(chunk)
+        except Exception as e:
+            print(f"[!] Translation error on a chunk, leaving it untranslated: {e}")
+            result = chunk
+        translated_lines.extend(result.split("\n"))
+
+    # Guard against the translator merging/splitting lines unexpectedly.
+    if len(translated_lines) != len(prefixes):
+        translated_lines = texts  # fall back to untranslated rather than misaligning
+
+    with open(dest_path, "w", encoding="utf-8") as f_out:
+        for prefix, tline in zip(prefixes, translated_lines):
+            f_out.write(f"{prefix}{tline}\n")
+
+def prompt_translation_choice():
+    raw = input(
+        "\nTranslate finished transcripts too? Enter a target language code "
+        "(e.g. 'es', 'fr', 'ja'), or press Enter to skip: "
+    ).strip()
+    return raw.lower() or None
+
+# --- 3. GET THE LINK AND FIGURE OUT WHAT IT IS ---
+TRANSLATE_LANG = prompt_translation_choice()
+
+link = input("Paste a link to a single audio file (.ogg/.oga/.mp3/.wav/.m4a/.flac) OR a ZIP of multiple files: ").strip()
+suggested_name = download_link(link, DOWNLOAD_PATH)
+
+if not os.path.exists(DOWNLOAD_PATH) or os.path.getsize(DOWNLOAD_PATH) == 0:
+    raise ValueError("Download failed or produced an empty file. Check the link and try again.")
+
+print(f"[OK] Downloaded {os.path.getsize(DOWNLOAD_PATH) / 1_000_000:.1f} MB (as '{suggested_name}')")
+
+# Auto-detect: is this a ZIP, or a single audio file?
+if zipfile.is_zipfile(DOWNLOAD_PATH):
+    print("[+] Detected a ZIP archive - extracting all audio files...")
+    with zipfile.ZipFile(DOWNLOAD_PATH, "r") as zf:
+        zf.extractall(EXTRACT_DIR)
+    audio_files = sorted(
+        os.path.join(root, f)
+        for root, _, files in os.walk(EXTRACT_DIR)
+        for f in files
+        if f.lower().endswith(AUDIO_EXTS)
+    )
+    if not audio_files:
+        raise ValueError(f"No supported audio files ({', '.join(AUDIO_EXTS)}) found inside that ZIP.")
+else:
+    # Single audio file - drop it into EXTRACT_DIR under its real name so the
+    # rest of the pipeline (built for batches) treats it identically.
+    ext = os.path.splitext(suggested_name)[1].lower()
+    if ext not in AUDIO_EXTS:
+        raise ValueError(
+            f"Downloaded file '{suggested_name}' doesn't look like a supported "
+            f"audio format ({', '.join(AUDIO_EXTS)}) or a ZIP. Check the link."
+        )
+    single_name = os.path.splitext(os.path.basename(suggested_name))[0] + ext
+    single_path = os.path.join(EXTRACT_DIR, single_name)
+    shutil.move(DOWNLOAD_PATH, single_path)
+    audio_files = [single_path]
+
+print(f"[OK] {len(audio_files)} audio file(s) queued for transcription.")
+
+# --- 4. CLEAR GPU MEMORY AND LOAD MODEL (once, reused across all files) ---
+gc.collect()
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+    torch.cuda.ipc_collect()
+
+from faster_whisper import WhisperModel
+
+HAS_GPU = torch.cuda.is_available()
+
+if HAS_GPU:
+    gpu_name = torch.cuda.get_device_name(0)
+    print(f"[+] GPU Detected ({gpu_name}).")
+    if "T4" in gpu_name:
+        print("[+] T4 detected - using int8_float16 quantization on medium model for better speed...")
+        model = WhisperModel("medium", device="cuda", compute_type="int8_float16")
+    else:
+        print("[+] Loading faster-whisper on GPU (float16, large-v3)...")
+        model = WhisperModel("large-v3", device="cuda", compute_type="float16")
+else:
+    print("[!] CPU-Only mode detected (No GPU attached to Colab).")
+    print("[+] Loading faster-whisper on CPU (int8)...")
+    model = WhisperModel("small", device="cpu", compute_type="int8")
+
+# --- 5. PROCESS EACH FILE, WITH PER-FILE RESUME ---
+state = load_state()
+
+for audio_path in audio_files:
+    fname = os.path.basename(audio_path)
+    fsize = os.path.getsize(audio_path)
+    key = f"{fname}_{fsize}"
+    out_name = os.path.splitext(fname)[0] + ".txt"
+    out_path = os.path.join(TRANSCRIPTS_DIR, out_name)
+
+    entry = state.get(key, {"last_end": 0.0, "done": False})
+
+    if entry.get("done"):
+        print(f"\n[=] Skipping '{fname}' - already fully transcribed.")
+        if TRANSLATE_LANG:
+            translated_path = os.path.join(TRANSCRIPTS_DIR, os.path.splitext(fname)[0] + f"_{TRANSLATE_LANG}.txt")
+            if not os.path.exists(translated_path):
+                print(f"[+] Translating existing transcript to '{TRANSLATE_LANG}'...")
+                translate_transcript_file(out_path, translated_path, TRANSLATE_LANG)
+                print(f"[OK] Saved translation: {translated_path}")
+        continue
+
+    resume_offset = float(entry.get("last_end", 0.0))
+    if resume_offset > 0:
+        print(f"\n[+] Resuming '{fname}' from {resume_offset:.2f}s")
+    else:
+        print(f"\n[+] Transcribing '{fname}'...")
+        open(out_path, "w", encoding="utf-8").close()  # fresh start for this file
+
+    process_path = audio_path
+    if resume_offset > 0:
+        process_path = os.path.join(EXTRACT_DIR, "resume_" + fname)
+        # Deliberately NOT using -c copy: stream-copy seeking snaps to the
+        # nearest keyframe, and audio formats like ogg have sparse keyframes,
+        # so the resume point can drift by seconds. Putting -ss after -i and
+        # re-encoding forces ffmpeg to decode and land on the exact timestamp.
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", audio_path, "-ss", str(resume_offset), process_path],
+            check=True, capture_output=True
+        )
+
+    segments, info = model.transcribe(process_path, beam_size=1)
+    print(f"[+] Detected language: {info.language} (probability {info.language_probability:.2f})")
+
+    with open(out_path, "a", encoding="utf-8") as f_out:
+        for segment in segments:
+            start, end = segment.start + resume_offset, segment.end + resume_offset
+            line = f"[{start:.2f}s -> {end:.2f}s] {segment.text}\n"
+            f_out.write(line)
+            f_out.flush()
+            os.fsync(f_out.fileno())
+            print(line, end="")
+
+            entry["last_end"] = end
+            state[key] = entry
+            save_state(state)
+
+    entry["done"] = True
+    state[key] = entry
+    save_state(state)
+
+    if process_path != audio_path and os.path.exists(process_path):
+        os.remove(process_path)
+
+    print(f"[OK] '{fname}' -> {out_path}")
+
+    if TRANSLATE_LANG:
+        translated_path = os.path.join(TRANSCRIPTS_DIR, os.path.splitext(fname)[0] + f"_{TRANSLATE_LANG}.txt")
+        print(f"[+] Translating transcript to '{TRANSLATE_LANG}'...")
+        translate_transcript_file(out_path, translated_path, TRANSLATE_LANG)
+        print(f"[OK] Saved translation: {translated_path}")
+
+# --- 6. CLEANUP: only once every file in the batch is done ---
+all_done = all(state.get(f"{os.path.basename(p)}_{os.path.getsize(p)}", {}).get("done") for p in audio_files)
+
+if all_done:
+    print("\n[+] All file(s) complete - cleaning up...")
+    try:
+        if os.path.exists(DOWNLOAD_PATH):
+            os.remove(DOWNLOAD_PATH)
+        if os.path.exists(EXTRACT_DIR):
+            shutil.rmtree(EXTRACT_DIR)
+        if os.path.exists(STATE_FILE):
+            os.remove(STATE_FILE)  # fully complete - next run starts fresh
+        print("[OK] Cleanup complete.")
+    except Exception as e:
+        print(f"[!] Cleanup skipped: {e}")
+else:
+    print("\n[!] Some files did not finish - state preserved for resume on next run.")
+
+print(f"\n[OK] Finished! Transcripts saved in Google Drive: {TRANSCRIPTS_DIR}")
