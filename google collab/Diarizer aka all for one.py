@@ -7,32 +7,38 @@ parity to your original two scripts - model choice, cross-segment context
 continuity, T4-aware quantization, link/ZIP download, fine-grained resume),
 translation, and reassembly. One script, four modes.
 
-  1. SPLIT       - pyannote diarization, splits source audio into one file
-                    per speaker turn, saves segments + manifest.json to Drive.
+  1. SPLIT       - pyannote diarization. Writes only a lightweight manifest.json
+                    (timestamps + speaker labels). No permanent per-turn WAVs
+                    by default; audio stays local and is reconstructed on demand.
   2. TRANSCRIBE  - auto-transcribes segments missing a transcript. Backend
-                    of your choice (Groq or local), with the same model
-                    choice, context continuity, and resume behavior your
-                    original scripts had. Skips anything already transcribed,
-                    so hand-dropped files (e.g. from your laptop) are left alone.
+                    of your choice (Groq or local). Reconstructs needed audio
+                    slices from the normalized full file using timestamps in
+                    the manifest. Skips anything already transcribed (crash-safe).
   3. REASSEMBLE  - stitches everything into one ordered, speaker + language
                     tagged transcript, auto-filling any still-missing segment
                     first. Offers translation (deep-translator, no API key).
-  4. FULL RUN    - split -> transcribe -> reassemble, no manual handoff.
+  4. FULL RUN    - split -> transcribe -> reassemble + optional cleanup.
 
-Nothing about your original scripts is touched - this is a self-contained
-re-implementation of the same Groq/faster-whisper/download/translation logic,
-wrapped around pyannote diarization.
+STORAGE DESIGN (space-friendly)
+-------------------------------
+- Bulk audio (downloads, normalized full WAV, temporary slices) lives only in
+  local /content/tmp_diarize. Never written to Drive by default.
+- Drive only stores: manifest.json (the cut list), text transcripts, final
+  outputs, and the small token/key files.
+- Per-turn WAVs are reconstructed on-the-fly from the normalized audio using
+  the start/end timestamps already stored in the manifest.
+- Active cleanup deletes temporary slices immediately after each transcription.
+- A cleanup handler at the end of FULL RUN / REASSEMBLE can remove local
+  audio artifacts while leaving manifests + transcripts intact for resume.
 
-HOW TO USE IN COLAB
---------------------
-Run it, mounts Drive automatically, asks which mode. Everything lives under
-MyDrive/Transcripts/ so it persists across sessions:
-    MyDrive/Transcripts/
-        segments/<source_basename>/    seg_0001_SPEAKER_00.wav, manifest.json
-        transcripts/                   <seg>_transcript.txt (Groq) or <seg>.txt (local)
-        hf_token.json                  pyannote token (asked once, split mode only)
-        groq_keys.json                 Groq API key(s) (asked once, add more anytime)
-        local_resume_state.json        fine-grained resume tracking (local backend)
+RESUME / CRASH SAFETY
+---------------------
+- Groq: each finished segment is written immediately to Drive as
+  transcripts/<stem>_transcript.txt
+- Local: line-by-line flush+fsync + local_resume_state.json so even a
+  mid-segment crash can resume from the last completed timestamp.
+- Re-running TRANSCRIBE or FULL RUN simply skips any segment that already
+  has a transcript file.
 
 YOU DO NEED A HUGGING FACE TOKEN FOR SPLIT MODE
 --------------------------------------------------
@@ -95,18 +101,31 @@ if IN_COLAB:
     if not os.path.exists(drive_mount_path):
         drive.mount(drive_mount_path)
     DRIVE_SAVE_DIR = "/content/drive/MyDrive/Transcripts"
+    LOCAL_WORK_DIR = "/content/tmp_diarize"          # bulk audio stays here (local only)
 else:
     DRIVE_SAVE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Transcripts")
+    LOCAL_WORK_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tmp_diarize")
 
 os.makedirs(DRIVE_SAVE_DIR, exist_ok=True)
-SEGMENTS_ROOT = os.path.join(DRIVE_SAVE_DIR, "segments")
+os.makedirs(LOCAL_WORK_DIR, exist_ok=True)
+
+SEGMENTS_ROOT = os.path.join(DRIVE_SAVE_DIR, "segments")          # only manifests live here now
 DEFAULT_TRANSCRIPTS_DIR = os.path.join(DRIVE_SAVE_DIR, "transcripts")
 os.makedirs(DEFAULT_TRANSCRIPTS_DIR, exist_ok=True)
 TOKEN_FILE = os.path.join(DRIVE_SAVE_DIR, "hf_token.json")
 GROQ_KEYS_FILE = os.path.join(DRIVE_SAVE_DIR, "groq_keys.json")
 LOCAL_RESUME_FILE = os.path.join(DRIVE_SAVE_DIR, "local_resume_state.json")
-DOWNLOAD_DIR = os.path.join(DRIVE_SAVE_DIR, "downloads")
+
+# All bulk audio stays local – never written to Drive by default
+DOWNLOAD_DIR = os.path.join(LOCAL_WORK_DIR, "downloads")
+NORMALIZED_DIR = os.path.join(LOCAL_WORK_DIR, "normalized")
+TEMP_SLICES_DIR = os.path.join(LOCAL_WORK_DIR, "slices")
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+os.makedirs(NORMALIZED_DIR, exist_ok=True)
+os.makedirs(TEMP_SLICES_DIR, exist_ok=True)
+
+# Optional: still write per-turn WAVs (legacy / debugging). Default off.
+WRITE_SEGMENT_WAVS = False
 
 DEFAULT_MERGE_GAP = 0.5
 DEFAULT_MIN_SEGMENT = 0.3
@@ -522,15 +541,16 @@ def detect_language(wav_path: str):
 
 
 def normalize_audio_for_diarization(audio_path: str) -> str:
-    """Convert any input to a clean 16 kHz mono WAV.
-    Avoids pyannote sample-count mismatches that happen with some OGG/MP3 files."""
+    """Convert any input to a clean 16 kHz mono WAV stored in LOCAL work dir.
+    Avoids pyannote sample-count mismatches that happen with some OGG/MP3 files.
+    Never writes the normalized file to Drive."""
     basename = os.path.splitext(os.path.basename(audio_path))[0]
-    clean_path = os.path.join(DOWNLOAD_DIR, f"{basename}_16k_mono.wav")
+    clean_path = os.path.join(NORMALIZED_DIR, f"{basename}_16k_mono.wav")
 
     if os.path.exists(clean_path) and os.path.getsize(clean_path) > 0:
         return clean_path
 
-    print("[+] Normalizing audio to 16 kHz mono WAV (avoids pyannote sample-count bugs)...")
+    print("[+] Normalizing audio to 16 kHz mono WAV (local only, avoids pyannote sample-count bugs)...")
     try:
         subprocess.run(
             [
@@ -549,14 +569,22 @@ def normalize_audio_for_diarization(audio_path: str) -> str:
         audio = audio.set_channels(1).set_frame_rate(16000)
         audio.export(clean_path, format="wav")
 
-    print(f"[OK] Normalized → {clean_path} ({os.path.getsize(clean_path)/1_000_000:.1f} MB)")
+    print(f"[OK] Normalized → {clean_path} ({os.path.getsize(clean_path)/1_000_000:.1f} MB) [local]")
     return clean_path
 
 
-def split_file(audio_path: str, merge_gap: float, min_segment: float, do_langid: bool, hf_token: str):
+def split_file(audio_path: str, merge_gap: float, min_segment: float, do_langid: bool, hf_token: str,
+               write_segment_wavs: bool = None):
+    """Diarize and write a lightweight manifest of timestamps.
+    By default does NOT write per-turn WAV files (they are reconstructed later
+    from the normalized full audio using the timestamps). Set write_segment_wavs=True
+    (or the global WRITE_SEGMENT_WAVS) if you still want the old behaviour."""
     from pydub import AudioSegment
 
-    # Normalize first so pyannote never sees the original OGG/MP3
+    if write_segment_wavs is None:
+        write_segment_wavs = WRITE_SEGMENT_WAVS
+
+    # Normalize first so pyannote never sees the original OGG/MP3 (stays local)
     clean_path = normalize_audio_for_diarization(audio_path)
 
     turns = run_diarization(clean_path, hf_token)
@@ -571,39 +599,130 @@ def split_file(audio_path: str, merge_gap: float, min_segment: float, do_langid:
     out_dir = os.path.join(SEGMENTS_ROOT, basename)
     os.makedirs(out_dir, exist_ok=True)
 
-    print("[+] Loading audio for slicing...")
-    # Slice from the clean 16 kHz file so timings stay consistent
-    audio = AudioSegment.from_file(clean_path)
+    # Only load full audio into memory if we need to write WAVs or run langid
+    audio = None
+    if write_segment_wavs or do_langid:
+        print("[+] Loading normalized audio for optional slicing / language ID...")
+        audio = AudioSegment.from_file(clean_path)
 
-    manifest = {"source_file": os.path.abspath(audio_path), "segments": []}
+    manifest = {
+        "source_file": os.path.abspath(audio_path),
+        "normalized_audio": clean_path,          # local path – used for on-the-fly reconstruction
+        "segments": [],
+    }
 
     for i, (start_sec, end_sec, speaker) in enumerate(turns, start=1):
         seg_filename = f"seg_{i:04d}_{speaker}.wav"
-        seg_path = os.path.join(out_dir, seg_filename)
-        audio[int(start_sec * 1000):int(end_sec * 1000)].export(seg_path, format="wav")
+        seg_path = os.path.join(out_dir, seg_filename) if write_segment_wavs else None
+
+        if write_segment_wavs and audio is not None:
+            audio[int(start_sec * 1000):int(end_sec * 1000)].export(seg_path, format="wav")
 
         language, language_prob = (None, None)
         if do_langid:
             try:
-                language, language_prob = detect_language(seg_path)
+                if write_segment_wavs and seg_path and os.path.exists(seg_path):
+                    language, language_prob = detect_language(seg_path)
+                else:
+                    # Extract a short-lived temp slice just for language ID
+                    tmp_slice = os.path.join(TEMP_SLICES_DIR, f"langid_{basename}_{i:04d}.wav")
+                    if audio is None:
+                        audio = AudioSegment.from_file(clean_path)
+                    audio[int(start_sec * 1000):int(end_sec * 1000)].export(tmp_slice, format="wav")
+                    language, language_prob = detect_language(tmp_slice)
+                    try:
+                        os.remove(tmp_slice)
+                    except OSError:
+                        pass
             except Exception as e:
                 print(f"[!] Language ID failed on segment {i}: {e}")
 
         manifest["segments"].append({
-            "index": i, "file": seg_filename, "speaker": speaker,
-            "start_sec": round(start_sec, 3), "end_sec": round(end_sec, 3),
-            "language": language, "language_prob": language_prob,
+            "index": i,
+            "file": seg_filename,               # kept for transcript naming compatibility
+            "speaker": speaker,
+            "start_sec": round(start_sec, 3),
+            "end_sec": round(end_sec, 3),
+            "language": language,
+            "language_prob": language_prob,
         })
 
         lang_note = f", lang={language} ({language_prob})" if language else ""
-        print(f"  [{i}/{len(turns)}] {seg_filename}  {start_sec:.2f}s-{end_sec:.2f}s  {speaker}{lang_note}")
+        wav_note = " [WAV written]" if write_segment_wavs else ""
+        print(f"  [{i}/{len(turns)}] {seg_filename}  {start_sec:.2f}s-{end_sec:.2f}s  {speaker}{lang_note}{wav_note}")
 
     manifest_path = os.path.join(out_dir, "manifest.json")
     with open(manifest_path, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
 
-    print(f"[SUCCESS] Segments + manifest written to: {out_dir}")
+    if write_segment_wavs:
+        print(f"[SUCCESS] Per-turn WAVs + manifest written to: {out_dir}")
+    else:
+        print(f"[SUCCESS] Lightweight manifest written to: {out_dir}")
+        print(f"          (no permanent per-turn WAVs – will reconstruct from normalized audio on demand)")
     return manifest_path
+
+
+def ensure_normalized_audio(manifest: dict) -> str:
+    """Return a usable path to the normalized full audio.
+    Prefers the path stored in the manifest; if missing, re-normalizes from source_file."""
+    norm = manifest.get("normalized_audio")
+    if norm and os.path.exists(norm) and os.path.getsize(norm) > 0:
+        return norm
+
+    source = manifest.get("source_file")
+    if source and os.path.exists(source):
+        print("[+] Normalized audio missing – re-creating from source_file...")
+        return normalize_audio_for_diarization(source)
+
+    raise FileNotFoundError(
+        "Neither normalized_audio nor source_file is available. "
+        "Cannot reconstruct segments. Re-run SPLIT mode."
+    )
+
+
+def extract_segment_slice(normalized_path: str, start_sec: float, end_sec: float,
+                          out_path: str = None) -> str:
+    """Cut [start_sec:end_sec] from the normalized full audio into a short-lived temp file.
+    Returns the path to the temp slice. Caller is responsible for deleting it after use."""
+    if out_path is None:
+        os.makedirs(TEMP_SLICES_DIR, exist_ok=True)
+        out_path = os.path.join(
+            TEMP_SLICES_DIR,
+            f"slice_{int(start_sec*1000)}_{int(end_sec*1000)}_{os.getpid()}.wav"
+        )
+
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-y",
+                "-ss", str(start_sec),
+                "-to", str(end_sec),
+                "-i", normalized_path,
+                "-ac", "1", "-ar", "16000", "-sample_fmt", "s16",
+                out_path,
+            ],
+            check=True, capture_output=True,
+        )
+    except Exception:
+        from pydub import AudioSegment
+        audio = AudioSegment.from_file(normalized_path)
+        audio[int(start_sec * 1000):int(end_sec * 1000)].export(out_path, format="wav")
+
+    return out_path
+
+
+def get_segment_audio_path(manifest: dict, seg: dict, seg_dir: str) -> tuple:
+    """Return (path_to_audio, is_temporary).
+    Prefer an existing permanent WAV (legacy); otherwise reconstruct a temp slice
+    from the normalized full audio using the timestamps in the manifest."""
+    legacy = os.path.join(seg_dir, seg["file"])
+    if os.path.exists(legacy) and os.path.getsize(legacy) > 0:
+        return legacy, False
+
+    norm = ensure_normalized_audio(manifest)
+    tmp = extract_segment_slice(norm, seg["start_sec"], seg["end_sec"])
+    return tmp, True
 
 
 def do_split_mode(prompt_for_settings: bool = True):
@@ -618,19 +737,23 @@ def do_split_mode(prompt_for_settings: bool = True):
         return []
 
     merge_gap, min_segment, do_langid = DEFAULT_MERGE_GAP, DEFAULT_MIN_SEGMENT, True
+    write_wavs = WRITE_SEGMENT_WAVS
     if prompt_for_settings:
         raw = input(f"Merge same-speaker gaps under how many seconds? (default {DEFAULT_MERGE_GAP}): ").strip()
         merge_gap = float(raw) if raw else DEFAULT_MERGE_GAP
         raw = input(f"Drop segments shorter than how many seconds? (default {DEFAULT_MIN_SEGMENT}): ").strip()
         min_segment = float(raw) if raw else DEFAULT_MIN_SEGMENT
         do_langid = input("Run per-segment language ID? (Y/n): ").strip().lower() != "n"
+        write_wavs = input(
+            "Also write permanent per-turn WAV files? (rarely needed, uses lots of space) (y/N): "
+        ).strip().lower() == "y"
 
     manifest_paths = []
     for f in files:
         if not os.path.exists(f):
             print(f"[!] File not found, skipping: {f}")
             continue
-        mp = split_file(f, merge_gap, min_segment, do_langid, hf_token)
+        mp = split_file(f, merge_gap, min_segment, do_langid, hf_token, write_segment_wavs=write_wavs)
         if mp:
             manifest_paths.append(mp)
     return manifest_paths
@@ -843,7 +966,13 @@ def auto_transcribe_missing(manifest_path: str, transcripts_dirs: list, backend:
     """Transcribes any segment in the manifest that doesn't already have a
     transcript file in transcripts_dirs, in chronological order, carrying
     running context forward for continuity (dropped on a detected language
-    switch, same as your original scripts). Returns count newly transcribed."""
+    switch, same as your original scripts).
+
+    Reconstructs audio on-the-fly from the normalized full file + timestamps
+    when permanent per-turn WAVs are absent. Temporary slices are deleted
+    immediately after each segment is transcribed to keep disk usage low.
+    Transcripts are written to Drive immediately so a crash can be resumed.
+    Returns count newly transcribed."""
     with open(manifest_path, "r", encoding="utf-8") as f:
         manifest = json.load(f)
 
@@ -859,6 +988,7 @@ def auto_transcribe_missing(manifest_path: str, transcripts_dirs: list, backend:
         return 0
 
     print(f"[+] {len(missing_indices)} segment(s) need transcribing (backend: {backend}, style: {style}).")
+    print("[+] Audio will be reconstructed on-the-fly from normalized file + timestamps when needed.")
 
     client_holder = None
     api_keys = []
@@ -878,11 +1008,15 @@ def auto_transcribe_missing(manifest_path: str, transcripts_dirs: list, backend:
     done_count = 0
     for n, idx in enumerate(missing_indices, 1):
         seg = all_segments[idx]
-        seg_path = os.path.join(seg_dir, seg["file"])
         stem = os.path.splitext(seg["file"])[0]
-        print(f"  [{n}/{len(missing_indices)}] Transcribing {seg['file']} ({backend}/{style})...")
+        print(f"  [{n}/{len(missing_indices)}] Transcribing {seg['file']} "
+              f"({seg['start_sec']:.2f}s-{seg['end_sec']:.2f}s) ({backend}/{style})...")
 
+        seg_path = None
+        is_temp = False
         try:
+            seg_path, is_temp = get_segment_audio_path(manifest, seg, seg_dir)
+
             if backend == "groq":
                 text, lang = transcribe_segment_groq(client_holder, api_keys, seg_path, model_id, running_context)
                 out_path = os.path.join(DEFAULT_TRANSCRIPTS_DIR, f"{stem}_transcript.txt")
@@ -908,6 +1042,13 @@ def auto_transcribe_missing(manifest_path: str, transcripts_dirs: list, backend:
             print("    Progress so far is saved (completed segments + any partial local segment stay written) - "
                   "rerun transcribe/reassemble later to pick up where this left off.")
             break
+        finally:
+            # Active cleanup: never leave temporary slices around
+            if is_temp and seg_path and os.path.exists(seg_path):
+                try:
+                    os.remove(seg_path)
+                except OSError:
+                    pass
 
     with open(manifest_path, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
@@ -1148,6 +1289,85 @@ def do_reassemble_mode(manifest_path: str = None):
 
 
 # =========================================================================
+# CLEANUP
+# =========================================================================
+def cleanup_local_audio(aggressive: bool = False, manifest_paths: list = None):
+    """Remove bulk audio that is no longer needed.
+    - Always: purge TEMP_SLICES_DIR and any leftover temporary files.
+    - Light (default): also remove DOWNLOAD_DIR contents and NORMALIZED_DIR.
+    - Aggressive: additionally remove any leftover per-turn WAVs under the
+      given manifest directories (or the whole SEGMENTS_ROOT tree of WAVs),
+      leaving only manifest.json + text transcripts on Drive.
+
+    Never deletes transcripts, final outputs, tokens, or keys.
+    """
+    import glob as _glob
+
+    removed_bytes = 0
+    removed_files = 0
+
+    def _rm(path):
+        nonlocal removed_bytes, removed_files
+        try:
+            if os.path.isfile(path):
+                removed_bytes += os.path.getsize(path)
+                os.remove(path)
+                removed_files += 1
+            elif os.path.isdir(path):
+                shutil.rmtree(path, ignore_errors=True)
+        except OSError:
+            pass
+
+    # 1. Always clear short-lived slices
+    if os.path.isdir(TEMP_SLICES_DIR):
+        for f in _glob.glob(os.path.join(TEMP_SLICES_DIR, "*")):
+            _rm(f)
+
+    if not aggressive:
+        for d in (DOWNLOAD_DIR, NORMALIZED_DIR):
+            if os.path.isdir(d):
+                for f in _glob.glob(os.path.join(d, "*")):
+                    _rm(f)
+        print(f"[+] Light cleanup: removed {removed_files} local audio file(s) "
+              f"({removed_bytes / 1_000_000:.1f} MB). Manifests + transcripts kept.")
+        return
+
+    # Aggressive: also drop any permanent per-turn WAVs that may exist
+    targets = []
+    if manifest_paths:
+        for mp in manifest_paths:
+            d = os.path.dirname(mp)
+            targets.extend(_glob.glob(os.path.join(d, "seg_*.wav")))
+    else:
+        targets = _glob.glob(os.path.join(SEGMENTS_ROOT, "*", "seg_*.wav"))
+
+    for f in targets:
+        _rm(f)
+
+    for d in (DOWNLOAD_DIR, NORMALIZED_DIR):
+        if os.path.isdir(d):
+            for f in _glob.glob(os.path.join(d, "*")):
+                _rm(f)
+
+    print(f"[+] Aggressive cleanup: removed {removed_files} audio file(s) "
+          f"({removed_bytes / 1_000_000:.1f} MB). Only manifests + text transcripts remain.")
+
+
+def prompt_and_cleanup(manifest_paths: list = None):
+    """Ask the user whether (and how aggressively) to clean up local audio."""
+    print("\n[+] Cleanup options (frees Colab / local disk and avoids filling Drive):")
+    print("  1. Light   – delete downloads, normalized full audio, and temp slices")
+    print("  2. Aggressive – also delete any leftover per-turn WAVs (keeps only manifests + transcripts)")
+    print("  3. Skip")
+    raw = input("Choose 1-3 (default 1): ").strip()
+    if raw == "3":
+        print("[+] Skipping cleanup.")
+        return
+    aggressive = raw == "2"
+    cleanup_local_audio(aggressive=aggressive, manifest_paths=manifest_paths)
+
+
+# =========================================================================
 # FULL RUN MODE
 # =========================================================================
 def do_full_run():
@@ -1174,16 +1394,19 @@ def do_full_run():
             translated_entries = translate_entries(entries, target_lang)
             write_outputs(translated_entries, f"{output_basename}_{target_lang}", manifest.get("source_file"))
 
+    # Cleanup at the end of a successful full run
+    prompt_and_cleanup(manifest_paths)
+
 
 # =========================================================================
 # MAIN
 # =========================================================================
 def main():
     print("Which step do you want to run?")
-    print("  1. SPLIT       - diarize + split source audio into speaker-turn segments")
-    print("  2. TRANSCRIBE  - auto-transcribe segments missing a transcript (Groq or local)")
+    print("  1. SPLIT       - diarize (writes lightweight timestamp manifest only)")
+    print("  2. TRANSCRIBE  - auto-transcribe missing segments (reconstructs audio on demand)")
     print("  3. REASSEMBLE  - stitch transcribed segments into one transcript (auto-fills gaps)")
-    print("  4. FULL RUN    - split -> transcribe -> reassemble, all in one go")
+    print("  4. FULL RUN    - split -> transcribe -> reassemble + cleanup")
     choice = input("Choose 1-4: ").strip()
 
     if choice == "1":
@@ -1192,6 +1415,7 @@ def main():
         do_transcribe_mode()
     elif choice == "3":
         do_reassemble_mode()
+        prompt_and_cleanup()
     elif choice == "4":
         do_full_run()
     else:
