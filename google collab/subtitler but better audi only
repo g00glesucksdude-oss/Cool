@@ -30,9 +30,24 @@ TRANSCRIPTS_DIR = os.path.join(DRIVE_SAVE_DIR, "transcripts")
 STATE_FILE = os.path.join(DRIVE_SAVE_DIR, "batch_state.json")
 DOWNLOAD_PATH = "downloaded_input"
 EXTRACT_DIR = "batch_audio"
+CHUNK_DIR = "audio_chunks"
 AUDIO_EXTS = (".ogg", ".oga", ".mp3", ".wav", ".m4a", ".flac")
+
+# Target length per chunk (seconds). 600 = 10 min.
+# Lower this (e.g. 300) if you still OOM on T4 / large models.
+CHUNK_SECONDS = 600
+
+# How hard we look for silence around the target cut point.
+# We search Â± this many seconds for a quiet gap.
+SILENCE_SEARCH_WINDOW = 45          # seconds before/after the ideal cut
+MIN_SILENCE_DURATION = 0.4          # seconds of quiet needed to count as a gap
+SILENCE_THRESHOLD_DB = -35          # dB below which is considered silence
+# Small pad kept on both sides of a silence cut so speech isn't clipped
+SILENCE_PAD = 0.15                  # seconds
+
 os.makedirs(TRANSCRIPTS_DIR, exist_ok=True)
 os.makedirs(EXTRACT_DIR, exist_ok=True)
+os.makedirs(CHUNK_DIR, exist_ok=True)
 
 # --- STATE HELPERS ---
 def load_state():
@@ -44,6 +59,13 @@ def load_state():
 def save_state(state):
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f)
+
+def clear_memory():
+    """Aggressively free RAM + VRAM between chunks."""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
 
 # --- URL HELPERS ---
 def safe_encode_url(url):
@@ -67,9 +89,6 @@ def resolve_mediafire(url):
     with urllib.request.urlopen(req) as resp:
         html = resp.read().decode("utf-8", errors="ignore")
 
-    # Try a couple of known patterns in case Mediafire tweaks their markup -
-    # this scraping approach is inherently fragile against unannounced UI
-    # changes, so we try more than one shape before giving up.
     patterns = [
         r'href="(https?://download[^"]+)"',
         r'id="downloadButton"[^>]*href="([^"]+)"',
@@ -104,7 +123,6 @@ def download_from_gdrive(file_id, dest):
         token_match = re.search(r'confirm=([0-9A-Za-z_-]+)', html)
         uuid_match = re.search(r'name="uuid" value="([^"]+)"', html)
         if uuid_match:
-            # Newer Drive interstitial page (large files)
             confirm_match = re.search(r'name="confirm" value="([^"]+)"', html)
             confirm_val = confirm_match.group(1) if confirm_match else "t"
             resp = opener.open(
@@ -113,15 +131,10 @@ def download_from_gdrive(file_id, dest):
             )
         elif token_match:
             resp = opener.open(f"{base}&id={file_id}&confirm={token_match.group(1)}")
-        # else: small file, no confirmation needed - html was probably a real error page
 
     fname = guess_filename(f"{base}&id={file_id}", resp.headers)
     content_type = resp.headers.get("Content-Type", "")
     if "text/html" in content_type:
-        # Still got HTML back after our confirmation attempt - Google's
-        # interstitial page format has changed again, or the file is
-        # private/restricted. This scraping approach can't recover from
-        # that automatically.
         raise ValueError(
             "Google Drive returned a webpage instead of the file. This usually "
             "means the file isn't shared as 'Anyone with the link', or Drive's "
@@ -178,8 +191,6 @@ if zipfile.is_zipfile(DOWNLOAD_PATH):
     if not audio_files:
         raise ValueError(f"No supported audio files ({', '.join(AUDIO_EXTS)}) found inside that ZIP.")
 else:
-    # Single audio file - drop it into EXTRACT_DIR under its real name so the
-    # rest of the pipeline (built for batches) treats it identically.
     ext = os.path.splitext(suggested_name)[1].lower()
     if ext not in AUDIO_EXTS:
         raise ValueError(
@@ -194,10 +205,7 @@ else:
 print(f"[OK] {len(audio_files)} audio file(s) queued for transcription.")
 
 # --- 4. CLEAR GPU MEMORY AND LOAD MODEL (once, reused across all files) ---
-gc.collect()
-if torch.cuda.is_available():
-    torch.cuda.empty_cache()
-    torch.cuda.ipc_collect()
+clear_memory()
 
 from faster_whisper import WhisperModel
 
@@ -207,7 +215,7 @@ if HAS_GPU:
     gpu_name = torch.cuda.get_device_name(0)
     print(f"[+] GPU Detected ({gpu_name}).")
     if "T4" in gpu_name:
-        print("[+] T4 detected - using int8_float16 quantization on medium model for better speed...")
+        print("[+] T4 detected - using int8_float16 quantization on medium model for better speed/memory...")
         model = WhisperModel("medium", device="cuda", compute_type="int8_float16")
     else:
         print("[+] Loading faster-whisper on GPU (float16, large-v3)...")
@@ -217,7 +225,134 @@ else:
     print("[+] Loading faster-whisper on CPU (int8)...")
     model = WhisperModel("small", device="cpu", compute_type="int8")
 
-# --- 5. PROCESS EACH FILE, WITH PER-FILE RESUME ---
+# ---------- SILENCE-AWARE CHUNKING ----------
+def get_audio_duration(path):
+    """Return duration in seconds via ffprobe."""
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        path,
+    ]
+    out = subprocess.check_output(cmd, text=True).strip()
+    return float(out)
+
+def detect_silences(path, noise_db=SILENCE_THRESHOLD_DB, min_dur=MIN_SILENCE_DURATION):
+    """
+    Run ffmpeg silencedetect and return list of (silence_start, silence_end) tuples.
+    """
+    cmd = [
+        "ffmpeg", "-hide_banner", "-i", path,
+        "-af", f"silencedetect=noise={noise_db}dB:d={min_dur}",
+        "-f", "null", "-",
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    # silencedetect prints to stderr
+    text = result.stderr
+
+    starts = [float(m) for m in re.findall(r"silence_start:\s*([\d.]+)", text)]
+    ends   = [float(m) for m in re.findall(r"silence_end:\s*([\d.]+)", text)]
+
+    # Pair them up (ffmpeg always emits start then end)
+    silences = []
+    for s, e in zip(starts, ends):
+        if e > s:
+            silences.append((s, e))
+    return silences
+
+def find_best_cut(ideal_time, silences, search_window=SILENCE_SEARCH_WINDOW):
+    """
+    Among silence gaps that overlap [ideal_time - window, ideal_time + window],
+    pick the one whose midpoint is closest to ideal_time.
+    Returns the midpoint of that silence (or None if none found).
+    """
+    best = None
+    best_dist = float("inf")
+    lo = ideal_time - search_window
+    hi = ideal_time + search_window
+
+    for s_start, s_end in silences:
+        # Does this silence interval overlap our search window?
+        if s_end < lo or s_start > hi:
+            continue
+        mid = (s_start + s_end) / 2.0
+        dist = abs(mid - ideal_time)
+        if dist < best_dist:
+            best_dist = dist
+            best = mid
+    return best
+
+def split_into_chunks(audio_path, chunk_seconds=CHUNK_SECONDS):
+    """
+    Split audio into ~chunk_seconds pieces, preferring to cut in the middle
+    of a silence gap so speakers are not interrupted mid-sentence.
+
+    Returns list of (chunk_path, start_offset_seconds).
+    """
+    base = os.path.splitext(os.path.basename(audio_path))[0]
+    duration = get_audio_duration(audio_path)
+    print(f"[+] Audio duration: {duration/60:.1f} min")
+
+    if duration <= chunk_seconds * 1.2:
+        # Short enough â€“ just one chunk (still convert to consistent WAV)
+        out = os.path.join(CHUNK_DIR, f"{base}_0000.wav")
+        cmd = [
+            "ffmpeg", "-y", "-i", audio_path,
+            "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le",
+            out,
+        ]
+        subprocess.run(cmd, check=True, capture_output=True)
+        print("[OK] Single chunk (file is short).")
+        return [(out, 0.0)]
+
+    print("[+] Detecting silence gaps for clean cuts...")
+    silences = detect_silences(audio_path)
+    print(f"[+] Found {len(silences)} silence gap(s)")
+
+    # Build list of cut points (absolute times where we will end a chunk)
+    cuts = []
+    next_ideal = chunk_seconds
+    while next_ideal < duration - 30:   # leave a little room at the end
+        cut = find_best_cut(next_ideal, silences)
+        if cut is None:
+            # No good silence nearby â€“ hard cut at the ideal time
+            cut = next_ideal
+            print(f"    (no silence near {next_ideal:.0f}s â€“ hard cut)")
+        else:
+            print(f"    cut at {cut:.1f}s (silence near ideal {next_ideal:.0f}s)")
+        cuts.append(cut)
+        next_ideal = cut + chunk_seconds
+
+    # Always end at the real duration
+    if not cuts or cuts[-1] < duration - 1.0:
+        cuts.append(duration)
+
+    # Now extract the actual chunks with a tiny pad so we don't clip speech
+    result = []
+    prev = 0.0
+    for i, cut in enumerate(cuts):
+        # Add a little silence pad on the cut (except first start / last end)
+        start = max(0.0, prev - (SILENCE_PAD if i > 0 else 0.0))
+        end   = min(duration, cut + (SILENCE_PAD if cut < duration else 0.0))
+        length = end - start
+
+        out = os.path.join(CHUNK_DIR, f"{base}_{i:04d}.wav")
+        cmd = [
+            "ffmpeg", "-y",
+            "-ss", f"{start:.3f}",
+            "-i", audio_path,
+            "-t", f"{length:.3f}",
+            "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le",
+            out,
+        ]
+        subprocess.run(cmd, check=True, capture_output=True)
+        result.append((out, start))   # start offset used for timestamp correction
+        prev = cut
+
+    print(f"[OK] Created {len(result)} chunk(s) with silence-aware cuts.")
+    return result
+
+# --- 5. PROCESS EACH FILE, WITH PER-FILE + PER-CHUNK RESUME ---
 state = load_state()
 
 for audio_path in audio_files:
@@ -227,58 +362,77 @@ for audio_path in audio_files:
     out_name = os.path.splitext(fname)[0] + ".txt"
     out_path = os.path.join(TRANSCRIPTS_DIR, out_name)
 
-    entry = state.get(key, {"last_end": 0.0, "done": False})
+    entry = state.get(key, {"last_end": 0.0, "done": False, "chunks_done": 0})
 
     if entry.get("done"):
         print(f"\n[=] Skipping '{fname}' - already fully transcribed.")
         continue
 
     resume_offset = float(entry.get("last_end", 0.0))
+    chunks_already_done = int(entry.get("chunks_done", 0))
+
     if resume_offset > 0:
-        print(f"\n[+] Resuming '{fname}' from {resume_offset:.2f}s")
+        print(f"\n[+] Resuming '{fname}' from {resume_offset:.2f}s (chunk {chunks_already_done})")
     else:
         print(f"\n[+] Transcribing '{fname}'...")
-        open(out_path, "w", encoding="utf-8").close()  # fresh start for this file
+        open(out_path, "w", encoding="utf-8").close()  # fresh start
 
-    process_path = audio_path
-    if resume_offset > 0:
-        process_path = os.path.join(EXTRACT_DIR, "resume_" + fname)
-        # Deliberately NOT using -c copy: stream-copy seeking snaps to the
-        # nearest keyframe, and audio formats like ogg have sparse keyframes,
-        # so the resume point can drift by seconds. Putting -ss after -i and
-        # re-encoding forces ffmpeg to decode and land on the exact timestamp.
-        subprocess.run(
-            ["ffmpeg", "-y", "-i", audio_path, "-ss", str(resume_offset), process_path],
-            check=True, capture_output=True
-        )
+    # Split the whole file into silence-aware chunks
+    chunks = split_into_chunks(audio_path, CHUNK_SECONDS)
 
-    segments, info = model.transcribe(process_path, beam_size=1)
-    print(f"[+] Detected language: {info.language} (probability {info.language_probability:.2f})")
+    # Skip chunks that were already fully transcribed in a previous run
+    for idx, (chunk_path, chunk_start) in enumerate(chunks):
+        if idx < chunks_already_done:
+            if os.path.exists(chunk_path):
+                os.remove(chunk_path)
+            continue
 
-    with open(out_path, "a", encoding="utf-8") as f_out:
-        for segment in segments:
-            start, end = segment.start + resume_offset, segment.end + resume_offset
-            line = f"[{start:.2f}s -> {end:.2f}s] {segment.text}\n"
-            f_out.write(line)
-            f_out.flush()
-            os.fsync(f_out.fileno())
-            print(line, end="")
+        print(f"\n--- Chunk {idx+1}/{len(chunks)}  (starts at {chunk_start:.1f}s) ---")
 
-            entry["last_end"] = end
-            state[key] = entry
-            save_state(state)
+        try:
+            segments, info = model.transcribe(
+                chunk_path,
+                beam_size=1,
+                vad_filter=True,                     # skip pure silence
+                condition_on_previous_text=False,    # prevents cascading hallucinations
+            )
+            if idx == chunks_already_done:
+                print(f"[+] Detected language: {info.language} (probability {info.language_probability:.2f})")
+
+            with open(out_path, "a", encoding="utf-8") as f_out:
+                for segment in segments:
+                    start = segment.start + chunk_start
+                    end   = segment.end   + chunk_start
+                    line = f"[{start:.2f}s -> {end:.2f}s] {segment.text}\n"
+                    f_out.write(line)
+                    f_out.flush()
+                    os.fsync(f_out.fileno())
+                    print(line, end="")
+
+                    entry["last_end"] = end
+                    state[key] = entry
+                    save_state(state)
+
+        finally:
+            # Always delete the chunk + free memory
+            if os.path.exists(chunk_path):
+                os.remove(chunk_path)
+            clear_memory()
+
+        entry["chunks_done"] = idx + 1
+        state[key] = entry
+        save_state(state)
 
     entry["done"] = True
     state[key] = entry
     save_state(state)
-
-    if process_path != audio_path and os.path.exists(process_path):
-        os.remove(process_path)
-
     print(f"[OK] '{fname}' -> {out_path}")
 
 # --- 6. CLEANUP: only once every file in the batch is done ---
-all_done = all(state.get(f"{os.path.basename(p)}_{os.path.getsize(p)}", {}).get("done") for p in audio_files)
+all_done = all(
+    state.get(f"{os.path.basename(p)}_{os.path.getsize(p)}", {}).get("done")
+    for p in audio_files
+)
 
 if all_done:
     print("\n[+] All file(s) complete - cleaning up...")
@@ -287,8 +441,10 @@ if all_done:
             os.remove(DOWNLOAD_PATH)
         if os.path.exists(EXTRACT_DIR):
             shutil.rmtree(EXTRACT_DIR)
+        if os.path.exists(CHUNK_DIR):
+            shutil.rmtree(CHUNK_DIR)
         if os.path.exists(STATE_FILE):
-            os.remove(STATE_FILE)  # fully complete - next run starts fresh
+            os.remove(STATE_FILE)
         print("[OK] Cleanup complete.")
     except Exception as e:
         print(f"[!] Cleanup skipped: {e}")
