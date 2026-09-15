@@ -690,6 +690,12 @@ os.makedirs(_PRETRAINED_MODELS_DIR, exist_ok=True)
 DEFAULT_SEPFORMER_CACHE_DIR = os.path.join(_PRETRAINED_MODELS_DIR, "sepformer-whamr16k")
 DEFAULT_EMBEDDER_CACHE_DIR = os.path.join(_PRETRAINED_MODELS_DIR, "spkrec-ecapa-voxceleb")
 
+# Per-file SepFormer REGION cache (the small resumable .npz files, not the
+# ~1GB model checkpoint above) lives on Drive so it survives a full Colab
+# disconnect. Kept tiny in practice - see separate_regions_resumable.
+SEPFORMER_CACHE_ROOT = os.path.join(DRIVE_SAVE_DIR, "sepformer_region_cache")
+os.makedirs(SEPFORMER_CACHE_ROOT, exist_ok=True)
+
 
 def get_separator_model(device: str = "cuda", cache_dir: str = DEFAULT_SEPFORMER_CACHE_DIR):
     """Loads (or returns the already-loaded) SepFormer separation model.
@@ -1055,6 +1061,27 @@ def find_overlap_regions(turns: list, min_overlap: float = 0.3) -> list:
     return overlaps
 
 
+def _auto_sepformer_batch_size() -> int:
+    """Pick a batch size from whatever GPU is actually attached, so a T4
+    runtime and an A100 runtime both get a sensible default without you
+    having to edit a constant by hand. Falls back to the conservative
+    default (4) if there's no CUDA device or torch can't read the VRAM."""
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return 4
+        total_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+        if total_gb >= 35:      # A100 40/80GB and similar
+            return 24
+        if total_gb >= 20:      # V100 32GB, 3090/4090 24GB
+            return 16
+        if total_gb >= 13:      # T4 16GB (the common free-Colab GPU)
+            return 8
+        return 4                # smaller/unknown GPUs
+    except Exception:
+        return 4
+
+
 def separate_overlap_clip(audio: np.ndarray, sample_rate: int, start: float, end: float, separator) -> list:
     """Slices [start:end] out of `audio` (must already be `sample_rate`,
     mono, float32) and runs it through the separator.
@@ -1093,7 +1120,7 @@ def separate_overlap_clip(audio: np.ndarray, sample_rate: int, start: float, end
     return voices
 
 
-SEPFORMER_BATCH_SIZE = 4  # regions separated per GPU call; raise if you have VRAM to spare
+SEPFORMER_BATCH_SIZE = _auto_sepformer_batch_size()  # regions per GPU call; auto-sized from VRAM (T4->8, A100->24, ...)
 
 
 def _region_cache_path(cache_dir: str, region: dict) -> str:
@@ -1127,11 +1154,52 @@ def _save_cached_voices(cache_path: str, voices: list):
             pass
 
 
+MAX_REGION_CACHE_BYTES = 250 * 1024 * 1024  # hard cap on Drive space used by the SepFormer region cache
+
+
+def _dir_size_bytes(path: str) -> int:
+    total = 0
+    try:
+        for f in os.scandir(path):
+            if f.is_file():
+                total += f.stat().st_size
+    except OSError:
+        pass
+    return total
+
+
+def _evict_cache_if_over_budget(cache_dir: str, max_bytes: int = MAX_REGION_CACHE_BYTES):
+    """Safety net, not the main mechanism (see note in separate_regions_resumable
+    below about why the cache normally never gets anywhere near this cap).
+    If something pushes the cache dir over budget anyway, delete the oldest
+    files first until back under budget, so a run can never silently eat
+    unbounded Drive space."""
+    try:
+        entries = [(f.path, f.stat().st_mtime, f.stat().st_size) for f in os.scandir(cache_dir) if f.is_file()]
+    except OSError:
+        return
+    total = sum(size for _, _, size in entries)
+    if total <= max_bytes:
+        return
+    entries.sort(key=lambda e: e[1])  # oldest first
+    for path, _, size in entries:
+        if total <= max_bytes:
+            break
+        try:
+            os.remove(path)
+            total -= size
+        except OSError:
+            pass
+
+
 def separate_regions_resumable(
     audio: np.ndarray, sample_rate: int, regions: list, separator, cache_dir: str,
-    batch_size: int = SEPFORMER_BATCH_SIZE,
+    batch_size: int = SEPFORMER_BATCH_SIZE, on_region_ready=None,
 ) -> list:
-    """Separates every region in `regions`, resumable and batched.
+    """Separates every region in `regions`, resumable and batched, keeping
+    the on-disk cache small (bounded well under MAX_REGION_CACHE_BYTES,
+    normally to essentially just the in-flight batch) instead of growing to
+    hold every region in the file at once.
 
     RESUME: each region's separated voices are cached to `cache_dir` as soon
     as they're produced (atomic write via os.replace, so a crash mid-write
@@ -1139,26 +1207,52 @@ def separate_regions_resumable(
     the next run, any region whose cache file already exists is loaded
     straight from disk instead of being re-run through SepFormer - so a
     Colab disconnect partway through a long file only costs you the regions
-    that hadn't finished yet, not the whole file.
+    that hadn't finished yet, not the whole file. `cache_dir` lives on Drive
+    (see resolve_overlaps_before_diarization), so this survives a full
+    runtime disconnect, not just a kernel restart.
+
+    STORAGE: if `on_region_ready(index, region, voices)` is given, it's
+    called the moment each region's voices are available (cache hit OR
+    freshly separated) and the region's cache file is deleted right after
+    the callback returns. In practice this means at most one batch's worth
+    of region files ever sits on disk at a time - the batch that just
+    finished is consumed and erased before the next batch is even
+    separated, which is what keeps total cache usage tiny (a handful of MB)
+    regardless of how many regions the file has. If no callback is given,
+    cache files are kept until the caller removes them itself.
 
     SPEED: regions still needing separation are padded and batched together
-    (`batch_size` per GPU call, default 4) instead of one `separate_batch`
-    call per region, which is a serial-and-wasteful use of the GPU for
-    files with many short overlaps.
+    (`batch_size` per GPU call - see SEPFORMER_BATCH_SIZE, auto-sized to the
+    attached GPU) instead of one `separate_batch` call per region, which is
+    a serial and wasteful use of the GPU for files with many short overlaps.
 
-    Returns a list of voice-lists, same order/length as `regions`.
+    Returns a list of voice-lists, same order/length as `regions` (still
+    returned even when on_region_ready is used, so callers that want the
+    full in-memory result too don't have to change).
     """
     os.makedirs(cache_dir, exist_ok=True)
     results = [None] * len(regions)
     pending = []  # (index, region, clip) still needing separation
+
+    def _finish(i, region, voices, cache_path):
+        results[i] = voices
+        if on_region_ready is not None:
+            try:
+                on_region_ready(i, region, voices)
+            finally:
+                # consumed - erase immediately so the next batch has room
+                try:
+                    os.remove(cache_path)
+                except OSError:
+                    pass
 
     n_cached = 0
     for i, region in enumerate(regions):
         cache_path = _region_cache_path(cache_dir, region)
         cached = _load_cached_voices(cache_path)
         if cached is not None:
-            results[i] = cached
             n_cached += 1
+            _finish(i, region, cached, cache_path)
             continue
         start_sample = max(0, int(region["start"] * sample_rate))
         end_sample = min(len(audio), int(region["end"] * sample_rate))
@@ -1172,7 +1266,7 @@ def separate_regions_resumable(
         valid = [(i, region, clip) for i, region, clip in batch if len(clip) >= int(0.2 * sample_rate)]
         if not valid:
             for i, region, _ in batch:
-                results[i] = []
+                _finish(i, region, [], _region_cache_path(cache_dir, region))
             continue
 
         max_len = max(len(clip) for _, _, clip in valid)
@@ -1188,9 +1282,10 @@ def separate_regions_resumable(
             print(f"[!] batched separation failed ({e}); falling back to one-at-a-time for this batch")
             for i, region, clip in valid:
                 voices = separate_overlap_clip(audio, sample_rate, region["start"], region["end"], separator)
-                results[i] = voices
+                cache_path = _region_cache_path(cache_dir, region)
                 if voices:
-                    _save_cached_voices(_region_cache_path(cache_dir, region), voices)
+                    _save_cached_voices(cache_path, voices)
+                _finish(i, region, voices, cache_path)
             print(f"    [+] separated {batch_start + len(batch)}/{len(pending)} pending region(s)...")
             continue
 
@@ -1202,8 +1297,13 @@ def separate_regions_resumable(
                 if peak > 0:
                     voice = voice / peak * 0.9
                 voices.append(voice.astype(np.float32))
-            results[i] = voices
-            _save_cached_voices(_region_cache_path(cache_dir, region), voices)  # persisted immediately
+            cache_path = _region_cache_path(cache_dir, region)
+            _save_cached_voices(cache_path, voices)  # persisted immediately (in case on_region_ready raises)
+            _finish(i, region, voices, cache_path)
+
+        # Safety net only - normal operation never accumulates enough to hit this,
+        # since each finished batch is erased via _finish() before the next begins.
+        _evict_cache_if_over_budget(cache_dir)
 
         print(f"    [+] separated {batch_start + len(batch)}/{len(pending)} pending region(s)...")
 
@@ -1258,7 +1358,14 @@ def splice_overlaps_into_audio(audio: np.ndarray, sample_rate: int, overlap_regi
     # separate_batch call per region). The splice/concatenation logic below
     # is then just bookkeeping over the results, which stays cheap to redo.
     if cache_dir:
-        all_voices = separate_regions_resumable(audio, sample_rate, regions, separator, cache_dir)
+        # on_region_ready is a no-op here (splice still uses the returned list
+        # below, in order) - passing it is what makes separate_regions_resumable
+        # erase each region's cache file the moment it's produced, instead of
+        # letting the whole file's worth of regions pile up on Drive at once.
+        all_voices = separate_regions_resumable(
+            audio, sample_rate, regions, separator, cache_dir,
+            on_region_ready=lambda i, region, voices: None,
+        )
     else:
         all_voices = [separate_overlap_clip(audio, sample_rate, r["start"], r["end"], separator) for r in regions]
 
@@ -1441,7 +1548,16 @@ def _load_wav_mono_float32(path: str, target_sr: int = 16000):
         return samples, target_sr
 
 
-def detect_overlap_regions_osd(audio_path: str, hf_token: str, min_duration_on: float = 0.3,
+# Overlaps shorter than this are skipped entirely (never sent to SepFormer).
+# These are almost always short interjections ("yeah", "uh-huh") that add the
+# least value per second of GPU time - filtering them is usually the single
+# biggest speedup after raising the batch size. Tune between 0.3 (keep
+# nearly everything) and 0.5 (aggressive - cuts region count by roughly half
+# on typical conversational audio).
+MIN_OVERLAP_DURATION = 0.45
+
+
+def detect_overlap_regions_osd(audio_path: str, hf_token: str, min_duration_on: float = MIN_OVERLAP_DURATION,
                                min_duration_off: float = 0.1) -> list:
     """Run overlapped-speech detection. Returns list of {"start": float, "end": float}.
 
@@ -1526,7 +1642,9 @@ def detect_overlap_regions_osd(audio_path: str, hf_token: str, min_duration_on: 
             import numpy as np
             return np.partition(output, -2, axis=-1)[..., -2, np.newaxis]
 
-        inference = Inference(model, pre_aggregation_hook=to_osd, duration=5.0, step=0.5)
+        # Use the model's native training duration (10 s) to avoid the warning
+        # and get better results. step=0.5 keeps good temporal resolution.
+        inference = Inference(model, pre_aggregation_hook=to_osd, duration=10.0, step=0.5)
         if torch.cuda.is_available():
             inference.to(torch.device("cuda"))
 
@@ -1563,14 +1681,31 @@ def resolve_overlaps_before_diarization(clean_path: str, hf_token: str) -> tuple
         print("[+] No overlapping speech detected — skipping SepFormer.")
         return clean_path, None
 
+    # Belt-and-suspenders filter: detect_overlap_regions_osd already asks
+    # each backend for MIN_OVERLAP_DURATION, but not every fallback path
+    # honors that param exactly the same way, so re-filter here too.
+    n_before = len(regions)
+    regions = [r for r in regions if (r["end"] - r["start"]) >= MIN_OVERLAP_DURATION]
+    n_skipped = n_before - len(regions)
+    if n_skipped:
+        print(f"[+] Skipping {n_skipped} overlap region(s) shorter than {MIN_OVERLAP_DURATION:.2f}s "
+              f"({len(regions)} remaining for SepFormer).")
+    if not regions:
+        print("[+] Nothing left after filtering short overlaps — skipping SepFormer.")
+        return clean_path, None
+
     print(f"[+] Separating {len(regions)} overlap region(s) with SepFormer and splicing...")
     audio_np, sr = _load_wav_mono_float32(clean_path, target_sr=SAMPLE_RATE)
     basename = os.path.splitext(os.path.basename(clean_path))[0]
-    # Per-file cache dir: survives a crash/disconnect so a retry only
-    # separates whatever regions weren't finished yet. Only wiped below once
-    # the splice fully succeeds - left in place on any failure so the next
-    # attempt can resume instead of starting over.
-    region_cache_dir = os.path.join(NORMALIZED_DIR, f"{basename}_sepformer_cache")
+    # Per-file cache dir lives on DRIVE (not local /content), so it survives
+    # a full Colab disconnect, not just a kernel restart - a retry only
+    # separates whatever regions weren't finished yet. In normal operation
+    # this stays tiny: separate_regions_resumable erases each region's cache
+    # file as soon as it's consumed, so at most ~one batch's worth of region
+    # files (a few MB) ever sits here, well under MAX_REGION_CACHE_BYTES.
+    # Also wiped below once the splice fully succeeds - left in place on
+    # any failure so the next attempt can resume instead of starting over.
+    region_cache_dir = os.path.join(SEPFORMER_CACHE_ROOT, f"{basename}_sepformer_cache")
     try:
         import torch
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -2780,3 +2915,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+ 
