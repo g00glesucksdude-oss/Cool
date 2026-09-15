@@ -1,0 +1,2720 @@
+"""
+diarize_and_reassemble.py
+==========================
+Fully integrated, Colab-friendly pipeline: pyannote diarization/split,
+auto-transcription (Groq or local/Colab faster-whisper, with full feature
+parity to your original two scripts - model choice, cross-segment context
+continuity, T4-aware quantization, link/ZIP download, fine-grained resume),
+translation, and reassembly. One script, four modes.
+
+  1. SPLIT       - pyannote diarization. Writes only a lightweight manifest.json
+                    (timestamps + speaker labels). No permanent per-turn WAVs
+                    by default; audio stays local and is reconstructed on demand.
+  2. TRANSCRIBE  - auto-transcribes segments missing a transcript. Backend
+                    of your choice (Groq or local). Reconstructs needed audio
+                    slices from the normalized full file using timestamps in
+                    the manifest. Skips anything already transcribed (crash-safe).
+  3. REASSEMBLE  - stitches everything into one ordered, speaker + language
+                    tagged transcript, auto-filling any still-missing segment
+                    first. Offers translation (deep-translator, no API key).
+  4. FULL RUN    - split -> transcribe -> reassemble + optional cleanup.
+
+STORAGE DESIGN (space-friendly)
+-------------------------------
+- Bulk audio (downloads, normalized full WAV, temporary slices) lives only in
+  local /content/tmp_diarize. Never written to Drive by default.
+- Drive only stores: manifest.json (the cut list), text transcripts, final
+  outputs, and the small token/key files.
+- Per-turn WAVs are reconstructed on-the-fly from the normalized audio using
+  the start/end timestamps already stored in the manifest.
+- Active cleanup deletes temporary slices immediately after each transcription.
+- A cleanup handler at the end of FULL RUN / REASSEMBLE can remove local
+  audio artifacts while leaving manifests + transcripts intact for resume.
+
+OVERLAP RESOLUTION (optional, pre-diarization)
+----------------------------------------------
+When enabled, overlapping speech is handled BEFORE diarization:
+  1. pyannote OverlappedSpeechDetection finds regions where 2+ speakers talk
+  2. SepFormer separates those regions into sequential clean voices
+  3. The spliced (longer) audio is what gets diarized + transcribed
+  4. On REASSEMBLE, every timestamp is remapped back to the ORIGINAL timeline
+     via the splice manifest (the "transcript compiler")
+Requires: speechbrain + HF access to pyannote/segmentation-3.0
+
+MEMORY DESIGN (Colab-crash resistant)
+-------------------------------------
+- Never keeps the full normalized audio in pydub RAM unless permanent WAVs
+  are explicitly requested. Language-ID and transcription always use short
+  ffmpeg slices.
+- pyannote pipeline is deleted + CUDA cache cleared immediately after
+  diarization finishes.
+- faster-whisper models (langid + transcription) are explicitly unloaded
+  (CTranslate2 unload_model when available) and gc + torch.cuda.empty_cache
+  are called after each major phase so peak RSS does not accumulate across
+  SPLIT → TRANSCRIBE → REASSEMBLE.
+- SepFormer is loaded only for the splice step and unloaded before diarization.
+- Periodic light GC every few segments during long transcription runs.
+
+RESUME / CRASH SAFETY
+---------------------
+- Groq: each finished segment is written immediately to Drive as
+  transcripts/<stem>_transcript.txt
+- Local: line-by-line flush+fsync + local_resume_state.json so even a
+  mid-segment crash can resume from the last completed timestamp.
+- Re-running TRANSCRIBE or FULL RUN simply skips any segment that already
+  has a transcript file.
+
+YOU DO NEED A HUGGING FACE TOKEN FOR SPLIT MODE
+--------------------------------------------------
+pyannote/speaker-diarization-3.1 is gated - free, one-time setup:
+  1. Accept access on both pages while logged into huggingface.co:
+       https://huggingface.co/pyannote/speaker-diarization-3.1
+       https://huggingface.co/pyannote/segmentation-3.0
+  2. Grab a token: https://huggingface.co/settings/tokens
+
+TRANSLATION DOES NOT NEED A KEY
+--------------------------------
+Uses deep-translator's GoogleTranslator - free, no account.
+"""
+
+# --- 1. AUTO-INSTALL DEPENDENCIES ---
+import os
+import subprocess
+import sys
+
+# Installing pyannote.audio/faster-whisper can upgrade numpy underneath a
+# Colab kernel that already has an older numpy loaded in memory - that leaves
+# two incompatible binary versions half-loaded and breaks on first import
+# after a FRESH install (ImportError from numpy._core.umath etc). The fix is
+# a runtime restart, not different inputs. This marker + self-restart makes
+# that automatic instead of surfacing as a confusing crash: on a truly fresh
+# install we restart the kernel once and ask you to just re-run the cell -
+# /content survives the restart, so the marker is still there on the second
+# run and it proceeds normally with a clean numpy.
+_ON_COLAB = os.path.exists("/content")
+_RESTART_MARKER = "/content/.diarize_pipeline_deps_ready"
+_fresh_install = _ON_COLAB and not os.path.exists(_RESTART_MARKER)
+
+print("[+] Checking and installing dependencies...")
+reqs = ["pyannote.audio", "faster-whisper", "pydub", "groq", "deep-translator", "speechbrain"]
+subprocess.check_call([sys.executable, "-m", "pip", "install", "-q"] + reqs)
+
+if _fresh_install:
+    open(_RESTART_MARKER, "w").close()
+    print("\n[!] Fresh install - Colab's runtime needs a one-time restart so numpy/torch load cleanly.")
+    print("[+] Restarting automatically. When it reconnects (~10-20s), just run this cell again -")
+    print("    dependencies are already installed, so the second run starts straight into the menu.")
+    os.kill(os.getpid(), 9)
+
+# --- 2. IMPORTS ---
+import re
+import json
+import glob
+import time
+import shutil
+import zipfile
+import http.cookiejar
+import urllib.request
+import gc
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import urlsplit, urlunsplit, quote, urlparse
+
+IN_COLAB = "google.colab" in sys.modules or os.path.exists("/content")
+
+if IN_COLAB:
+    from google.colab import drive
+    drive_mount_path = "/content/drive"
+    if not os.path.exists(drive_mount_path):
+        drive.mount(drive_mount_path)
+    DRIVE_SAVE_DIR = "/content/drive/MyDrive/Transcripts"
+    LOCAL_WORK_DIR = "/content/tmp_diarize"          # bulk audio stays here (local only)
+else:
+    DRIVE_SAVE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Transcripts")
+    LOCAL_WORK_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tmp_diarize")
+
+os.makedirs(DRIVE_SAVE_DIR, exist_ok=True)
+os.makedirs(LOCAL_WORK_DIR, exist_ok=True)
+
+SEGMENTS_ROOT = os.path.join(DRIVE_SAVE_DIR, "segments")          # only manifests live here now
+DEFAULT_TRANSCRIPTS_DIR = os.path.join(DRIVE_SAVE_DIR, "transcripts")
+os.makedirs(DEFAULT_TRANSCRIPTS_DIR, exist_ok=True)
+TOKEN_FILE = os.path.join(DRIVE_SAVE_DIR, "hf_token.json")
+GROQ_KEYS_FILE = os.path.join(DRIVE_SAVE_DIR, "groq_keys.json")
+LOCAL_RESUME_FILE = os.path.join(DRIVE_SAVE_DIR, "local_resume_state.json")
+
+# All bulk audio stays local – never written to Drive by default
+DOWNLOAD_DIR = os.path.join(LOCAL_WORK_DIR, "downloads")
+NORMALIZED_DIR = os.path.join(LOCAL_WORK_DIR, "normalized")
+TEMP_SLICES_DIR = os.path.join(LOCAL_WORK_DIR, "slices")
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+os.makedirs(NORMALIZED_DIR, exist_ok=True)
+os.makedirs(TEMP_SLICES_DIR, exist_ok=True)
+
+# Optional: still write per-turn WAVs (legacy / debugging). Default off.
+WRITE_SEGMENT_WAVS = False
+
+DEFAULT_MERGE_GAP = 0.5
+DEFAULT_MIN_SEGMENT = 0.3
+LANGID_MODEL_SIZE = "small"          # used during split for the manifest's language field
+GROQ_MODEL_IDS = {"turbo": "whisper-large-v3-turbo", "large": "whisper-large-v3"}
+MAX_CHUNK_BYTES = 24 * 1024 * 1024   # Groq's 25MB limit, 1MB headroom
+RATE_LIMIT_COOLDOWN_SEC = 3
+CONTEXT_CHARS = 800                  # how much trailing context to feed forward for continuity
+AUDIO_EXTS = (".ogg", ".oga", ".mp3", ".wav", ".m4a", ".flac", ".mp4", ".webm")
+
+COLAB_LINE_RE = re.compile(r"^\[(\d+\.\d+)s\s*->\s*(\d+\.\d+)s\]\s?(.*)$")
+
+
+# =========================================================================
+# MEMORY MANAGEMENT (Colab / low-RAM friendly)
+# =========================================================================
+def free_memory(aggressive: bool = False):
+    """Force Python GC + clear CUDA cache. Call after large model / audio ops
+    to reduce peak RSS and prevent Colab OOM kills on long files."""
+    gc.collect()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            if aggressive:
+                torch.cuda.ipc_collect()
+                torch.cuda.synchronize()
+    except Exception:
+        pass
+
+
+def unload_langid_model():
+    """Drop the language-ID WhisperModel so its VRAM/RAM can be reclaimed
+    before the (much heavier) diarization or full transcription models load."""
+    global _langid_model
+    if _langid_model is not None:
+        try:
+            # faster-whisper / CTranslate2: explicit unload if available
+            if hasattr(_langid_model, "model") and hasattr(_langid_model.model, "unload_model"):
+                _langid_model.model.unload_model()
+        except Exception:
+            pass
+        _langid_model = None
+        free_memory(aggressive=True)
+
+
+def unload_transcribe_models():
+    """Drop every cached faster-whisper transcription model."""
+    global _transcribe_model_cache
+    for key, model in list(_transcribe_model_cache.items()):
+        try:
+            if hasattr(model, "model") and hasattr(model.model, "unload_model"):
+                model.model.unload_model()
+        except Exception:
+            pass
+        del _transcribe_model_cache[key]
+    _transcribe_model_cache.clear()
+    free_memory(aggressive=True)
+
+
+# =========================================================================
+# SHARED: HF TOKEN
+# =========================================================================
+def is_valid_hf_token(token: str) -> bool:
+    """Real HF tokens start with 'hf_' and are reasonably long.
+    Rejects dummy/placeholder values like '00000', empty strings, etc."""
+    if not token or not isinstance(token, str):
+        return False
+    token = token.strip()
+    if token.startswith("hf_") and len(token) >= 20:
+        return True
+    return False
+
+
+def load_token() -> str:
+    env_token = os.environ.get("HF_TOKEN")
+    if env_token and is_valid_hf_token(env_token):
+        return env_token.strip()
+    if os.path.exists(TOKEN_FILE):
+        try:
+            with open(TOKEN_FILE, "r", encoding="utf-8") as f:
+                token = json.load(f).get("token", "")
+            if is_valid_hf_token(token):
+                return token.strip()
+            print(f"[!] Found invalid/dummy HF token in {TOKEN_FILE} — clearing it.")
+            try:
+                os.remove(TOKEN_FILE)
+            except OSError:
+                pass
+        except (json.JSONDecodeError, OSError):
+            pass
+    return ""
+
+
+def save_token(token: str):
+    with open(TOKEN_FILE, "w", encoding="utf-8") as f:
+        json.dump({"token": token}, f, indent=2)
+
+
+def clear_hf_token():
+    """Remove any saved token (file + env) so the next get_hf_token() prompts again."""
+    os.environ.pop("HF_TOKEN", None)
+    if os.path.exists(TOKEN_FILE):
+        try:
+            os.remove(TOKEN_FILE)
+            print(f"[+] Cleared bad token file: {TOKEN_FILE}")
+        except OSError:
+            pass
+
+
+def get_hf_token(force: bool = False) -> str:
+    if not force:
+        token = load_token()
+        if token:
+            return token
+
+    print("\n[+] No valid Hugging Face token found.")
+    print("    Get one at https://huggingface.co/settings/tokens")
+    print("    Make sure you've accepted access to pyannote/speaker-diarization-3.1")
+    print("    and pyannote/segmentation-3.0 on huggingface.co first (see docstring above).")
+    token = input("Paste your Hugging Face token: ").strip()
+    if token and is_valid_hf_token(token):
+        save_token(token)
+        return token
+    if token:
+        print("[!] That does not look like a valid Hugging Face token (should start with 'hf_').")
+    return ""
+
+
+# =========================================================================
+# SHARED: GROQ KEY MANAGEMENT (mirrors subtitler_groq_version.py's pattern)
+# =========================================================================
+def load_groq_keys() -> list:
+    if not os.path.exists(GROQ_KEYS_FILE):
+        return []
+    try:
+        with open(GROQ_KEYS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return []
+
+
+def save_groq_keys(keys: list):
+    with open(GROQ_KEYS_FILE, "w", encoding="utf-8") as f:
+        json.dump(keys, f, indent=2)
+
+
+def add_groq_key_prompt(keys: list) -> list:
+    label = input("Label for this key (e.g. 'personal', 'work'): ").strip() or f"key{len(keys) + 1}"
+    key = input("Paste your Groq API key: ").strip()
+    keys.append({"label": label, "key": key})
+    save_groq_keys(keys)
+    print(f"[+] Saved '{label}'.")
+    return keys
+
+
+def select_groq_keys() -> list:
+    keys = load_groq_keys()
+    if not keys:
+        print("[+] No saved Groq API keys found on Drive. Let's add one.")
+        keys = add_groq_key_prompt(keys)
+
+    while True:
+        print("\nSaved Groq API keys:")
+        for i, k in enumerate(keys, 1):
+            print(f"  {i}. {k['label']}")
+        print(f"  {len(keys) + 1}. Add a new key")
+        raw = input("Select key(s) to use (e.g. '1' or '1,3' or 'all'): ").strip().lower()
+
+        if raw == "all":
+            return [k["key"] for k in keys]
+        if raw == str(len(keys) + 1):
+            keys = add_groq_key_prompt(keys)
+            continue
+        try:
+            indices = [int(x.strip()) for x in raw.split(",") if x.strip()]
+            selected = [keys[i - 1]["key"] for i in indices if 1 <= i <= len(keys)]
+            if selected:
+                return selected
+        except ValueError:
+            pass
+        print("[!] Couldn't parse that. Try again.")
+
+
+def is_quota_or_rate_limit_error(e: Exception) -> bool:
+    status = getattr(e, "status_code", None)
+    if status in (429, 401, 403):
+        return True
+    msg = str(e).lower()
+    return any(term in msg for term in ["rate limit", "rate_limit", "quota", "too many requests"])
+
+
+# =========================================================================
+# DOWNLOAD SUPPORT (direct links, Mediafire, Google Drive, ZIPs of many files)
+# =========================================================================
+def safe_encode_url(url: str) -> str:
+    parts = urlsplit(url)
+    path = quote(parts.path, safe="/%")
+    query = quote(parts.query, safe="=&%")
+    return urlunsplit((parts.scheme, parts.netloc, path, query, parts.fragment))
+
+
+def guess_filename(url: str, headers) -> str:
+    cd = headers.get("Content-Disposition", "")
+    match = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";\n]+)"?', cd)
+    if match:
+        return match.group(1).strip()
+    return os.path.basename(urlparse(url).path) or "downloaded_file"
+
+
+def resolve_mediafire(url: str) -> str:
+    print("[+] Mediafire link detected - resolving direct download URL...")
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req) as resp:
+        html = resp.read().decode("utf-8", errors="ignore")
+
+    patterns = [
+        r'href="(https?://download[^"]+)"',
+        r'id="downloadButton"[^>]*href="([^"]+)"',
+        r'"downloadUrl"\s*:\s*"([^"]+)"',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, html)
+        if match:
+            return safe_encode_url(match.group(1).replace("\\/", "/"))
+
+    raise ValueError(
+        "Could not find a direct download link on that Mediafire page. "
+        "Mediafire may have changed their page layout - try downloading "
+        "manually and re-hosting on a direct link instead."
+    )
+
+
+def extract_gdrive_id(url: str):
+    m = re.search(r"/file/d/([^/]+)", url) or re.search(r"[?&]id=([^&]+)", url)
+    return m.group(1) if m else None
+
+
+def download_from_gdrive(file_id: str, dest: str) -> str:
+    cookie_jar = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cookie_jar))
+    base = "https://drive.google.com/uc?export=download"
+
+    resp = opener.open(f"{base}&id={file_id}")
+    content_type = resp.headers.get("Content-Type", "")
+
+    if "text/html" in content_type:
+        html = resp.read().decode("utf-8", errors="ignore")
+        token_match = re.search(r'confirm=([0-9A-Za-z_-]+)', html)
+        uuid_match = re.search(r'name="uuid" value="([^"]+)"', html)
+        if uuid_match:
+            confirm_match = re.search(r'name="confirm" value="([^"]+)"', html)
+            confirm_val = confirm_match.group(1) if confirm_match else "t"
+            resp = opener.open(
+                f"https://drive.usercontent.google.com/download?id={file_id}"
+                f"&export=download&confirm={confirm_val}&uuid={uuid_match.group(1)}"
+            )
+        elif token_match:
+            resp = opener.open(f"{base}&id={file_id}&confirm={token_match.group(1)}")
+
+    fname = guess_filename(f"{base}&id={file_id}", resp.headers)
+    content_type = resp.headers.get("Content-Type", "")
+    if "text/html" in content_type:
+        raise ValueError(
+            "Google Drive returned a webpage instead of the file. This usually "
+            "means the file isn't shared as 'Anyone with the link', or Drive's "
+            "confirmation page format changed. Check sharing settings and retry."
+        )
+
+    with open(dest, "wb") as f_out:
+        f_out.write(resp.read())
+    return fname
+
+
+def download_link(url: str, dest: str) -> str:
+    url = safe_encode_url(url.strip())
+
+    if "drive.google.com" in url:
+        file_id = extract_gdrive_id(url)
+        if not file_id:
+            raise ValueError("Could not find a file ID in that Google Drive link.")
+        print("[+] Google Drive link detected - resolving direct download...")
+        return download_from_gdrive(file_id, dest)
+
+    if "mediafire.com" in url and "/file/" in url:
+        url = resolve_mediafire(url)
+
+    print(f"[+] Downloading from: {url}")
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req) as resp:
+        suggested_name = guess_filename(url, resp.headers)
+        with open(dest, "wb") as f_out:
+            f_out.write(resp.read())
+    return suggested_name
+
+
+def resolve_link_to_files(url: str) -> list:
+    """Downloads a link (direct/Mediafire/Google Drive), handles a ZIP of many
+    audio files or a single audio file, returns a list of local paths."""
+    dest = os.path.join(DOWNLOAD_DIR, "downloaded_input")
+    suggested_name = download_link(url, dest)
+    if not os.path.exists(dest) or os.path.getsize(dest) == 0:
+        raise ValueError("Download failed or produced an empty file. Check the link and try again.")
+    print(f"[OK] Downloaded {os.path.getsize(dest) / 1_000_000:.1f} MB (as '{suggested_name}')")
+
+    if zipfile.is_zipfile(dest):
+        print("[+] Detected a ZIP archive - extracting all audio files...")
+        extract_dir = os.path.join(DOWNLOAD_DIR, "extracted")
+        os.makedirs(extract_dir, exist_ok=True)
+        with zipfile.ZipFile(dest, "r") as zf:
+            zf.extractall(extract_dir)
+        audio_files = sorted(
+            os.path.join(root, f)
+            for root, _, files in os.walk(extract_dir)
+            for f in files
+            if f.lower().endswith(AUDIO_EXTS)
+        )
+        if not audio_files:
+            raise ValueError(f"No supported audio files ({', '.join(AUDIO_EXTS)}) found inside that ZIP.")
+        return audio_files
+
+    ext = os.path.splitext(suggested_name)[1].lower()
+    if ext not in AUDIO_EXTS:
+        raise ValueError(
+            f"Downloaded file '{suggested_name}' doesn't look like a supported "
+            f"audio format ({', '.join(AUDIO_EXTS)}) or a ZIP. Check the link."
+        )
+    single_name = os.path.splitext(os.path.basename(suggested_name))[0] + ext
+    single_path = os.path.join(DOWNLOAD_DIR, single_name)
+    shutil.move(dest, single_path)
+    return [single_path]
+
+
+# =========================================================================
+# SPLIT MODE
+# =========================================================================
+def select_audio_files_split() -> list:
+    print("\nHow do you want to provide audio?")
+    print("  1. Upload file(s)" + (" (Colab upload dialog)" if IN_COLAB else " (not available outside Colab)"))
+    print("  2. Type/paste local file path(s)")
+    print("  3. Paste a download link (direct URL, Mediafire, or Google Drive - single file or ZIP)")
+    choice = input("Choose 1-3 (default 2): ").strip()
+
+    if choice == "1" and IN_COLAB:
+        from google.colab import files as colab_files
+        print("[+] Upload audio file(s):")
+        uploaded = colab_files.upload()
+        if uploaded:
+            return list(uploaded.keys())
+        print("[!] No files uploaded.")
+        return []
+
+    if choice == "3":
+        url = input("Paste the link: ").strip()
+        try:
+            return resolve_link_to_files(url)
+        except Exception as e:
+            print(f"[!] Download failed: {e}")
+            return []
+
+    raw = input("Enter audio file path(s) (comma-separated): ").strip()
+    return [p.strip().strip('"') for p in raw.split(",") if p.strip()]
+
+
+def run_diarization(audio_path: str, hf_token: str):
+    from pyannote.audio import Pipeline
+    import torch
+
+    # Free any previous Whisper models so diarization has maximum headroom
+    unload_langid_model()
+    unload_transcribe_models()
+    free_memory(aggressive=True)
+
+    print("[+] Loading pyannote speaker-diarization-3.1 pipeline (first run downloads the model)...")
+    pipeline = None
+    try:
+        try:
+            pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", token=hf_token)
+        except TypeError:
+            # older pyannote.audio versions use the pre-deprecation kwarg name
+            pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", use_auth_token=hf_token)
+    except Exception as e:
+        err_name = type(e).__name__
+        err_msg = str(e).lower()
+        is_auth_fail = (
+            "401" in str(e)
+            or "gated" in err_msg
+            or "unauthorized" in err_msg
+            or "authentication" in err_msg
+            or err_name in ("GatedRepoError", "RepositoryNotFoundError", "HTTPStatusError")
+        )
+        if is_auth_fail:
+            print("\n[!] Hugging Face rejected the token (401 / gated model).")
+            print("    Clearing the bad token so the next run will ask again.")
+            clear_hf_token()
+            raise RuntimeError(
+                "Invalid or unauthorized Hugging Face token for the gated pyannote models.\n"
+                "  1. Accept access at:\n"
+                "       https://huggingface.co/pyannote/speaker-diarization-3.1\n"
+                "       https://huggingface.co/pyannote/segmentation-3.0\n"
+                "  2. Create a token at https://huggingface.co/settings/tokens\n"
+                "  3. Re-run this script — it will now prompt you for the token."
+            ) from e
+        raise
+
+    try:
+        if torch.cuda.is_available():
+            pipeline.to(torch.device("cuda"))
+            print("[+] Running diarization on GPU.")
+        else:
+            print("[+] Running diarization on CPU (this can be slow on long files).")
+
+        print(f"[+] Diarizing '{os.path.basename(audio_path)}'...")
+        output = pipeline(audio_path)
+
+        # pyannote.audio 4.x returns DiarizeOutput; older versions returned Annotation directly
+        if hasattr(output, "speaker_diarization"):
+            annotation = output.speaker_diarization
+        elif hasattr(output, "itertracks"):
+            annotation = output
+        else:
+            raise RuntimeError(
+                f"Unexpected pyannote output type: {type(output)}. "
+                "Expected Annotation or DiarizeOutput with .speaker_diarization"
+            )
+
+        raw_turns = []
+        for turn, _, speaker in annotation.itertracks(yield_label=True):
+            raw_turns.append((turn.start, turn.end, speaker))
+        raw_turns.sort(key=lambda t: t[0])
+        return raw_turns
+    finally:
+        # Critical for Colab: release the heavy pipeline + any intermediate tensors
+        del pipeline
+        free_memory(aggressive=True)
+
+
+def merge_and_filter(turns: list, merge_gap: float, min_segment: float) -> list:
+    if not turns:
+        return []
+    merged = [list(turns[0])]
+    for start, end, speaker in turns[1:]:
+        last = merged[-1]
+        if speaker == last[2] and start - last[1] <= merge_gap:
+            last[1] = end
+        else:
+            merged.append([start, end, speaker])
+    return [(s, e, spk) for s, e, spk in merged if (e - s) >= min_segment]
+
+
+_langid_model = None
+
+
+def get_langid_model():
+    global _langid_model
+    if _langid_model is None:
+        from faster_whisper import WhisperModel
+        import torch
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        compute_type = "int8_float16" if device == "cuda" else "int8"
+        print(f"[+] Loading faster-whisper '{LANGID_MODEL_SIZE}' for language ID ({device})...")
+        _langid_model = WhisperModel(LANGID_MODEL_SIZE, device=device, compute_type=compute_type)
+    return _langid_model
+
+
+def detect_language(wav_path: str):
+    model = get_langid_model()
+    segments, info = model.transcribe(wav_path, beam_size=1, language=None, vad_filter=False)
+    list(segments)  # drain generator, we only want info
+    # Do NOT free here – caller decides when to unload (after the whole split)
+    return info.language, round(info.language_probability, 3)
+
+
+def normalize_audio_for_diarization(audio_path: str) -> str:
+    """Convert any input to a clean 16 kHz mono WAV stored in LOCAL work dir.
+    Avoids pyannote sample-count mismatches that happen with some OGG/MP3 files.
+    Never writes the normalized file to Drive."""
+    basename = os.path.splitext(os.path.basename(audio_path))[0]
+    clean_path = os.path.join(NORMALIZED_DIR, f"{basename}_16k_mono.wav")
+
+    if os.path.exists(clean_path) and os.path.getsize(clean_path) > 0:
+        return clean_path
+
+    print("[+] Normalizing audio to 16 kHz mono WAV (local only, avoids pyannote sample-count bugs)...")
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-i", audio_path,
+                "-ac", "1",
+                "-ar", "16000",
+                "-sample_fmt", "s16",
+                clean_path,
+            ],
+            check=True, capture_output=True,
+        )
+    except Exception as e:
+        print(f"[!] ffmpeg normalize failed ({e}), falling back to pydub...")
+        from pydub import AudioSegment
+        audio = AudioSegment.from_file(audio_path)
+        audio = audio.set_channels(1).set_frame_rate(16000)
+        audio.export(clean_path, format="wav")
+
+    print(f"[OK] Normalized → {clean_path} ({os.path.getsize(clean_path)/1_000_000:.1f} MB) [local]")
+    return clean_path
+
+
+# =========================================================================
+# OVERLAP RESOLUTION (SepFormer, pre-diarization) — fully inlined
+# =========================================================================
+# Source: sepformer_overlap (speechbrain SepFormer + pyannote OSD + splice/remap)
+# No separate file needed — one cell, one script.
+
+import itertools
+from contextlib import contextmanager
+
+# --- begin inlined sepformer_overlap core ---
+import gc
+import itertools
+from contextlib import contextmanager
+
+import numpy as np
+import torch
+
+SAMPLE_RATE = 16000  # sepformer-whamr16k's expected input rate
+
+_separator_model = None
+_embedder_model = None
+
+# Persist downloaded checkpoints on Drive (when available) so a fresh Colab
+# runtime doesn't redownload SepFormer (~1GB) and the speaker embedder
+# (~80MB) every session. Falls back to a local folder off-Colab.
+_PRETRAINED_MODELS_DIR = os.path.join(DRIVE_SAVE_DIR, "pretrained_models") if IN_COLAB \
+    else os.path.join(LOCAL_WORK_DIR, "pretrained_models")
+os.makedirs(_PRETRAINED_MODELS_DIR, exist_ok=True)
+DEFAULT_SEPFORMER_CACHE_DIR = os.path.join(_PRETRAINED_MODELS_DIR, "sepformer-whamr16k")
+DEFAULT_EMBEDDER_CACHE_DIR = os.path.join(_PRETRAINED_MODELS_DIR, "spkrec-ecapa-voxceleb")
+
+
+def get_separator_model(device: str = "cuda", cache_dir: str = DEFAULT_SEPFORMER_CACHE_DIR):
+    """Loads (or returns the already-loaded) SepFormer separation model.
+    Call once, reuse across files - reloading per-clip is wasteful."""
+    global _separator_model
+    if _separator_model is None:
+        try:
+            from speechbrain.inference.separation import SepformerSeparation
+        except ImportError:
+            from speechbrain.pretrained import SepformerSeparation  # SpeechBrain <1.0 fallback
+        print("[+] Loading SepFormer speech-separation model (first run downloads ~1GB)...")
+        _separator_model = SepformerSeparation.from_hparams(
+            source="speechbrain/sepformer-whamr16k",
+            savedir=cache_dir,
+            run_opts={"device": device},
+        )
+    return _separator_model
+
+
+def unload_separator_model():
+    """Drop the model to free VRAM/RAM once you're done with a batch."""
+    global _separator_model
+    _separator_model = None
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def get_speaker_embedder(device: str = "cuda", cache_dir: str = "pretrained_models/spkrec-ecapa-voxceleb"):
+    """Loads (or returns the already-loaded) speaker-embedding model used
+    to match separated voices back to diarization speaker tags. Separate
+    from get_separator_model() so you only pay for it (VRAM + load time)
+    when you actually need speaker re-identification - see
+    overlap_resolution_session()."""
+    global _embedder_model
+    if _embedder_model is None:
+        try:
+            from speechbrain.inference.speaker import EncoderClassifier
+        except ImportError:
+            from speechbrain.pretrained import EncoderClassifier  # SpeechBrain <1.0 fallback
+        print("[+] Loading speaker-embedding model (first run downloads ~80MB)...")
+        _embedder_model = EncoderClassifier.from_hparams(
+            source="speechbrain/spkrec-ecapa-voxceleb",
+            savedir=cache_dir,
+            run_opts={"device": device},
+        )
+    return _embedder_model
+
+
+def unload_speaker_embedder():
+    """Drop the speaker-embedding model to free VRAM/RAM once you're done."""
+    global _embedder_model
+    _embedder_model = None
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+@contextmanager
+def model_session(load_fn, unload_fn, *load_args, **load_kwargs):
+    """Generic load -> use -> unload wrapper for ANY pipeline layer, not
+    just this module's own models. Point it at whatever loader/unloader
+    pair a layer already has (get_diarizer_model/unload_diarizer_model,
+    get_whisper_model/unload_whisper_model, etc.) and it guarantees the
+    model is dropped and VRAM is cleared when the block exits - including
+    on exception - so no layer is left resident while the next one loads.
+
+        with model_session(get_whisper_model, unload_whisper_model, device="cuda") as whisper:
+            text = whisper.transcribe(clip)
+        # whisper is unloaded here, before the next layer starts
+
+    This is what overlap_resolution_session() below is built on; use the
+    same pattern for the diarize and transcribe layers upstream of this
+    module - see diarize_session()/transcribe_session() for drop-in
+    templates you fill in with your actual Pyannote/Whisper calls.
+    """
+    model = load_fn(*load_args, **load_kwargs)
+    try:
+        yield model
+    finally:
+        unload_fn()
+
+
+@contextmanager
+def diarize_session(load_diarizer_fn, unload_diarizer_fn, *args, **kwargs):
+    """Template for the DIARIZE layer (Pyannote or similar). Wire your
+    existing get_diarizer_model()/unload_diarizer_model() functions in
+    here - or just call model_session(load_diarizer_fn, unload_diarizer_fn, ...)
+    directly wherever diarization happens - so the diarizer is guaranteed
+    to be freed before the transcribe layer loads Whisper:
+
+        with diarize_session(get_diarizer_model, unload_diarizer_model, device="cuda") as diarizer:
+            turns = run_diarization(diarizer, audio)
+        # diarizer freed here
+    """
+    with model_session(load_diarizer_fn, unload_diarizer_fn, *args, **kwargs) as diarizer:
+        yield diarizer
+
+
+@contextmanager
+def transcribe_session(load_transcriber_fn, unload_transcriber_fn, *args, **kwargs):
+    """Template for the TRANSCRIBE layer (Whisper or similar). Same
+    pattern as diarize_session() - wire in your actual load/unload pair
+    so Whisper is freed before overlap_resolution_session() loads
+    SepFormer for layer 4:
+
+        with transcribe_session(get_whisper_model, unload_whisper_model, device="cuda") as whisper:
+            main_pass_segments = run_transcription(whisper, audio, turns)
+        # whisper freed here, VRAM clear before SepFormer loads
+    """
+    with model_session(load_transcriber_fn, unload_transcriber_fn, *args, **kwargs) as transcriber:
+        yield transcriber
+
+
+@contextmanager
+def overlap_resolution_session(device: str = "cuda", need_embedder: bool = False):
+    """Scoped VRAM context for the whole overlap-resolution step. Loads
+    SepFormer (and, if requested, the speaker embedder) on entry and
+    unloads both on exit - even if the block raises - so you're never
+    holding Pyannote + Whisper + SepFormer (+ embedder) in VRAM at once.
+    Run this AFTER diarization/transcription are done and their models
+    are unloaded, not alongside them:
+
+        with overlap_resolution_session(need_embedder=True) as (separator, embedder):
+            refs = build_speaker_reference_embeddings(audio, sr, turns, overlaps, embedder)
+            results = separate_and_transcribe_overlaps(audio, sr, overlaps, separator, my_transcribe_fn)
+            for r in results:
+                r["speaker_labels"] = assign_speakers_to_voices(
+                    [...voices...], r["speakers"], refs, embedder
+                )
+        # separator + embedder are freed here, before the next pipeline stage
+    """
+    with model_session(get_separator_model, unload_separator_model, device=device) as separator:
+        if need_embedder:
+            with model_session(get_speaker_embedder, unload_speaker_embedder, device=device) as embedder:
+                yield separator, embedder
+        else:
+            yield separator, None
+
+
+def _embed(audio_np: np.ndarray, embedder) -> np.ndarray:
+    wav = torch.from_numpy(audio_np.astype(np.float32)).unsqueeze(0)
+    with torch.no_grad():
+        emb = embedder.encode_batch(wav)
+    return emb.squeeze().detach().cpu().numpy()
+
+
+def build_speaker_reference_embeddings(
+    audio: np.ndarray,
+    sample_rate: int,
+    turns: list,
+    overlaps: list,
+    embedder,
+    min_clip_dur: float = 1.0,
+    max_clips_per_speaker: int = 3,
+) -> dict:
+    """Fix for Speaker Disconnect (part 1/2): builds one reference voice
+    embedding per diarization speaker, using only their CLEAN (non-
+    overlapping) turns - i.e. audio you already know is that speaker
+    alone, no separation needed. Skips speakers with no clean turn long
+    enough to embed reliably (they just won't get matched later).
+
+    turns: same diarization turns you passed to find_overlap_regions().
+    overlaps: the output of find_overlap_regions() (used to exclude any
+        turn that touches an overlap window).
+
+    Returns {speaker_label: np.ndarray} - a mean embedding per speaker.
+    """
+    if sample_rate != SAMPLE_RATE:
+        raise ValueError(f"expects {SAMPLE_RATE} Hz audio (got {sample_rate} Hz). Resample first.")
+
+    def touches_overlap(turn):
+        for ov in overlaps:
+            if turn["start"] < ov["end"] and turn["end"] > ov["start"]:
+                return True
+        return False
+
+    by_speaker = {}
+    for t in turns:
+        if t["end"] - t["start"] < min_clip_dur:
+            continue
+        if touches_overlap(t):
+            continue
+        by_speaker.setdefault(t["speaker"], []).append(t)
+
+    refs = {}
+    for spk, clips in by_speaker.items():
+        clips = sorted(clips, key=lambda c: c["end"] - c["start"], reverse=True)[:max_clips_per_speaker]
+        embs = []
+        for c in clips:
+            s, e = int(c["start"] * sample_rate), int(c["end"] * sample_rate)
+            embs.append(_embed(audio[s:e], embedder))
+        if embs:
+            refs[spk] = np.mean(embs, axis=0)
+    return refs
+
+
+def assign_speakers_to_voices(voices: list, expected_speakers: tuple, speaker_refs: dict, embedder) -> list:
+    """Fix for Speaker Disconnect (part 2/2): matches SepFormer's
+    unlabeled separated voices back to SPEAKER_00/SPEAKER_01 (etc.)
+    instead of guessing the assignment. Embeds each separated voice and
+    picks the permutation against `expected_speakers`' reference
+    embeddings (from build_speaker_reference_embeddings) that maximizes
+    total cosine similarity - i.e. proper (if small, 2-way) assignment
+    rather than a greedy/positional guess.
+
+    expected_speakers: the ov["speakers"] tuple for this region, i.e. the
+        two diarization labels find_overlap_regions() said were involved.
+
+    Returns a list the same length as `voices`, each entry either the
+    matched speaker label or None if there wasn't enough reference data
+    to match confidently (e.g. one of the two speakers had no clean
+    turns anywhere in the file).
+    """
+    candidates = [s for s in expected_speakers if s in speaker_refs]
+    if len(candidates) < 2:
+        return [None] * len(voices)
+
+    voice_embs = [_embed(v, embedder) for v in voices]
+
+    def cos(a, b):
+        return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-8))
+
+    n = min(len(voice_embs), len(candidates))
+    best_perm, best_score = None, -1e9
+    for perm in itertools.permutations(range(len(candidates)), n):
+        total = sum(cos(voice_embs[i], speaker_refs[candidates[perm[i]]]) for i in range(n))
+        if total > best_score:
+            best_score, best_perm = total, perm
+
+    labels = [None] * len(voices)
+    for i, cand_idx in enumerate(best_perm):
+        labels[i] = candidates[cand_idx]
+    return labels
+
+
+def merge_overlap_entries_for_subtitles(entries: list, epsilon: float = 0.05) -> list:
+    """Fix for Out-of-Sync Subtitles: standard SRT/TXT compilers render
+    entries sequentially, so two voices both spanning 12.40s-14.10s become
+    two back-to-back entries with IDENTICAL timestamps - which breaks
+    strict SRT parsers and overlaps visually in players. This instead
+    collapses each overlap region into a SINGLE valid cue spanning
+    start-end, with each speaker's line stacked on its own line inside
+    that one cue - the same way professional closed captions render
+    simultaneous dialogue.
+
+    entries: the list returned by separate_and_transcribe_overlaps(),
+        optionally with a "speaker_labels" key added (same length/order
+        as "texts") from assign_speakers_to_voices() - falls back to
+        "Voice 1"/"Voice 2" if that key is absent or has Nones.
+
+    Returns a list of {"start", "end", "text"} ready to splice into your
+    final subtitle compiler IN PLACE of the individual per-voice entries
+    for that region (don't emit both - see exclude_overlap_spans_from_segments
+    for keeping the main pass from double-covering the same span).
+    """
+    merged = []
+    for e in entries:
+        raw_labels = e.get("speaker_labels") or [None] * len(e["texts"])
+        labels = [lbl or f"Voice {i + 1}" for i, lbl in enumerate(raw_labels)]
+        lines = [f"[{lbl}] {txt}" for lbl, txt in zip(labels, e["texts"]) if txt]
+        if not lines:
+            continue
+        merged.append({
+            "start": e["start"],
+            "end": max(e["end"], e["start"] + epsilon),
+            "text": "\n".join(lines),
+        })
+    return merged
+
+
+def make_voice_subsegment_keys(parent_segment_id: str, num_voices: int) -> list:
+    """Fix for Manifest Complexity (part 1/2): deterministic sub-keys for
+    a segment split into N separated voices, e.g. make_voice_subsegment_keys("seg_0001", 2)
+    -> ["seg_0001_v1", "seg_0001_v2"]."""
+    return [f"{parent_segment_id}_v{i + 1}" for i in range(num_voices)]
+
+
+def build_voice_manifest_entries(parent_segment_id: str, parent_entry: dict, num_voices: int) -> list:
+    """Fix for Manifest Complexity (part 2/2): expands one manifest
+    segment into N manifest-entry dicts for its separated voices, WITHOUT
+    changing manifest.json's schema - each new entry is a shallow copy of
+    the parent (same metadata) plus `parent_segment` and `voice_index`
+    keys, so code downstream that expects "one manifest entry == one
+    audio file == one text output" keeps working unmodified; it just sees
+    more rows, addressable by seg_0001_v1.wav / seg_0001_v2.wav.
+
+    Append the returned entries to manifest["segments"] in place of (or
+    alongside, if you want to keep the mixed original too) parent_entry.
+    """
+    keys = make_voice_subsegment_keys(parent_segment_id, num_voices)
+    entries = []
+    for i, key in enumerate(keys):
+        entry = dict(parent_entry)
+        entry["segment_id"] = key
+        entry["parent_segment"] = parent_segment_id
+        entry["voice_index"] = i
+        entry["audio_file"] = f"{parent_segment_id}_v{i + 1}.wav"
+        entries.append(entry)
+    return entries
+
+
+def exclude_overlap_spans_from_segments(segments: list, overlaps: list, min_remaining: float = 0.15) -> list:
+    """Fix for Redundant Transcriptions: trims (or drops) segments from
+    your MAIN transcription pass wherever they cover time already claimed
+    by an overlap region, so that time is transcribed exactly once - by
+    SepFormer's separated, cleaner voices via separate_and_transcribe_overlaps
+    - instead of twice (once blurrily on the mixed audio in the main
+    pass, once cleanly on the isolated voices).
+
+    Call this on your main-pass segments BEFORE compiling the final
+    output, then splice in merge_overlap_entries_for_subtitles()'s output
+    for the excluded spans. A segment fully inside an overlap region is
+    dropped; a segment that only partially overlaps is trimmed to
+    whichever non-overlapping remainder (if any) is >= min_remaining.
+    """
+    def overlapping_span(seg):
+        for ov in overlaps:
+            lo, hi = max(seg["start"], ov["start"]), min(seg["end"], ov["end"])
+            if hi > lo:
+                return lo, hi
+        return None
+
+    out = []
+    for seg in segments:
+        span = overlapping_span(seg)
+        if span is None:
+            out.append(seg)
+            continue
+        lo, hi = span
+        before, after = dict(seg), dict(seg)
+        before["end"], after["start"] = lo, hi
+        if before["end"] - before["start"] >= min_remaining:
+            out.append(before)
+        if after["end"] - after["start"] >= min_remaining:
+            out.append(after)
+    return out
+
+
+def find_overlap_regions(turns: list, min_overlap: float = 0.3) -> list:
+    """turns: list of {"start": float, "end": float, "speaker": str},
+    e.g. straight from whisperx.diarize.DiarizationPipeline's dataframe
+    (df[["start","end","speaker"]].to_dict("records")) or a pyannote
+    Annotation converted the same way.
+
+    Returns list of {"start", "end", "speakers": (spk_a, spk_b)} for every
+    pair of different-speaker turns that overlap by at least min_overlap
+    seconds.
+    """
+    sorted_turns = sorted(turns, key=lambda t: t["start"])
+    overlaps = []
+    for i in range(len(sorted_turns)):
+        for j in range(i + 1, len(sorted_turns)):
+            a, b = sorted_turns[i], sorted_turns[j]
+            if b["start"] >= a["end"]:
+                continue
+            if a["speaker"] == b["speaker"]:
+                continue
+            ov_start = max(a["start"], b["start"])
+            ov_end = min(a["end"], b["end"])
+            if ov_end - ov_start >= min_overlap:
+                overlaps.append({"start": ov_start, "end": ov_end, "speakers": (a["speaker"], b["speaker"])})
+    return overlaps
+
+
+def separate_overlap_clip(audio: np.ndarray, sample_rate: int, start: float, end: float, separator) -> list:
+    """Slices [start:end] out of `audio` (must already be `sample_rate`,
+    mono, float32) and runs it through the separator.
+
+    Returns a list of numpy float32 arrays, one per separated voice
+    (typically 2). Empty list if the clip is too short or separation fails.
+    """
+    if sample_rate != SAMPLE_RATE:
+        raise ValueError(
+            f"separate_overlap_clip expects {SAMPLE_RATE} Hz audio (got {sample_rate} Hz). "
+            "Resample the clip first, or load a different SepFormer checkpoint for your rate."
+        )
+
+    start_sample = max(0, int(start * sample_rate))
+    end_sample = min(len(audio), int(end * sample_rate))
+    if end_sample - start_sample < int(0.2 * sample_rate):
+        return []
+
+    clip = audio[start_sample:end_sample].astype(np.float32)
+    mix = torch.from_numpy(clip).float().unsqueeze(0)  # [1, time]
+
+    try:
+        with torch.no_grad():
+            est_sources = separator.separate_batch(mix)  # [1, time, num_speakers]
+    except Exception as e:
+        print(f"[!] separation failed on {start:.2f}s-{end:.2f}s ({e})")
+        return []
+
+    voices = []
+    for spk_idx in range(est_sources.shape[-1]):
+        voice = est_sources[0, :, spk_idx].detach().cpu().numpy().reshape(-1)
+        peak = np.max(np.abs(voice))
+        if peak > 0:
+            voice = voice / peak * 0.9  # normalize so it's not near-silent going into a transcriber
+        voices.append(voice.astype(np.float32))
+    return voices
+
+
+SEPFORMER_BATCH_SIZE = 4  # regions separated per GPU call; raise if you have VRAM to spare
+
+
+def _region_cache_path(cache_dir: str, region: dict) -> str:
+    return os.path.join(cache_dir, f"ov_{region['start']:.3f}_{region['end']:.3f}.npz")
+
+
+def _load_cached_voices(cache_path: str):
+    if not os.path.exists(cache_path):
+        return None
+    try:
+        data = np.load(cache_path)
+        return [data[f"v{i}"] for i in range(int(data["n"]))]
+    except Exception:
+        # corrupt/partial cache file (e.g. crash mid-write) - ignore and recompute
+        try:
+            os.remove(cache_path)
+        except OSError:
+            pass
+        return None
+
+
+def _save_cached_voices(cache_path: str, voices: list):
+    tmp_path = cache_path + ".tmp"
+    try:
+        np.savez(tmp_path, n=len(voices), **{f"v{i}": v for i, v in enumerate(voices)})
+        os.replace(tmp_path, cache_path)  # atomic - never leaves a half-written cache file
+    except Exception:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+
+
+def separate_regions_resumable(
+    audio: np.ndarray, sample_rate: int, regions: list, separator, cache_dir: str,
+    batch_size: int = SEPFORMER_BATCH_SIZE,
+) -> list:
+    """Separates every region in `regions`, resumable and batched.
+
+    RESUME: each region's separated voices are cached to `cache_dir` as soon
+    as they're produced (atomic write via os.replace, so a crash mid-write
+    never leaves a corrupt cache entry that would be silently trusted). On
+    the next run, any region whose cache file already exists is loaded
+    straight from disk instead of being re-run through SepFormer - so a
+    Colab disconnect partway through a long file only costs you the regions
+    that hadn't finished yet, not the whole file.
+
+    SPEED: regions still needing separation are padded and batched together
+    (`batch_size` per GPU call, default 4) instead of one `separate_batch`
+    call per region, which is a serial-and-wasteful use of the GPU for
+    files with many short overlaps.
+
+    Returns a list of voice-lists, same order/length as `regions`.
+    """
+    os.makedirs(cache_dir, exist_ok=True)
+    results = [None] * len(regions)
+    pending = []  # (index, region, clip) still needing separation
+
+    n_cached = 0
+    for i, region in enumerate(regions):
+        cache_path = _region_cache_path(cache_dir, region)
+        cached = _load_cached_voices(cache_path)
+        if cached is not None:
+            results[i] = cached
+            n_cached += 1
+            continue
+        start_sample = max(0, int(region["start"] * sample_rate))
+        end_sample = min(len(audio), int(region["end"] * sample_rate))
+        pending.append((i, region, audio[start_sample:end_sample].astype(np.float32)))
+
+    if n_cached:
+        print(f"[+] Resuming: {n_cached}/{len(regions)} region(s) already separated (loaded from cache).")
+
+    for batch_start in range(0, len(pending), batch_size):
+        batch = pending[batch_start:batch_start + batch_size]
+        valid = [(i, region, clip) for i, region, clip in batch if len(clip) >= int(0.2 * sample_rate)]
+        if not valid:
+            for i, region, _ in batch:
+                results[i] = []
+            continue
+
+        max_len = max(len(clip) for _, _, clip in valid)
+        padded = np.zeros((len(valid), max_len), dtype=np.float32)
+        for row, (_, _, clip) in enumerate(valid):
+            padded[row, :len(clip)] = clip
+        mix = torch.from_numpy(padded).float()
+
+        try:
+            with torch.no_grad():
+                est_sources = separator.separate_batch(mix)  # [B, time, num_speakers]
+        except Exception as e:
+            print(f"[!] batched separation failed ({e}); falling back to one-at-a-time for this batch")
+            for i, region, clip in valid:
+                voices = separate_overlap_clip(audio, sample_rate, region["start"], region["end"], separator)
+                results[i] = voices
+                if voices:
+                    _save_cached_voices(_region_cache_path(cache_dir, region), voices)
+            print(f"    [+] separated {batch_start + len(batch)}/{len(pending)} pending region(s)...")
+            continue
+
+        for row, (i, region, clip) in enumerate(valid):
+            voices = []
+            for spk_idx in range(est_sources.shape[-1]):
+                voice = est_sources[row, :len(clip), spk_idx].detach().cpu().numpy().reshape(-1)
+                peak = np.max(np.abs(voice))
+                if peak > 0:
+                    voice = voice / peak * 0.9
+                voices.append(voice.astype(np.float32))
+            results[i] = voices
+            _save_cached_voices(_region_cache_path(cache_dir, region), voices)  # persisted immediately
+
+        print(f"    [+] separated {batch_start + len(batch)}/{len(pending)} pending region(s)...")
+
+    return [v if v is not None else [] for v in results]
+
+
+def splice_overlaps_into_audio(audio: np.ndarray, sample_rate: int, overlap_regions: list, separator,
+                                cache_dir: str = None) -> tuple:
+    """PRE-DIARIZATION step. Takes raw audio + a list of {"start", "end"}
+    overlap regions (from an overlap detector, e.g. pyannote OSD - no
+    speaker IDs needed here), separates each region with SepFormer, and
+    splices the separated voices in SEQUENTIALLY (one after another) in
+    place of the original overlapping chunk.
+
+    This necessarily makes the output audio LONGER than the input by
+    (num_voices - 1) * region_duration for every region spliced, so every
+    timestamp after a splice point drifts relative to the original file.
+    That drift is fully recorded in the returned manifest so it can be
+    undone later with spliced_time_to_original().
+
+    overlap_regions: list of {"start": float, "end": float}, sorted or not
+        (this function sorts them internally).
+
+    Returns (new_audio: np.ndarray, manifest: dict). Pass new_audio into
+    your diarizer as normal; keep manifest to reverse-map timestamps once
+    you have transcript segments back from the diarize->chunk->transcribe
+    steps.
+
+    manifest format:
+    {
+      "sample_rate": 16000,
+      "splices": [
+        {
+          "original_start": 12.40, "original_end": 13.10,
+          "spliced_start": 12.40, "spliced_end": 13.80,
+          "num_voices": 2
+        },
+        ...
+      ]
+    }
+    Splices are stored in order of original_start; spliced_start/end are
+    in the NEW audio's timeline.
+    """
+    if sample_rate != SAMPLE_RATE:
+        raise ValueError(f"expects {SAMPLE_RATE} Hz audio (got {sample_rate} Hz). Resample first.")
+
+    regions = sorted(overlap_regions, key=lambda r: r["start"])
+    manifest = {"sample_rate": sample_rate, "splices": []}
+
+    # Separate every region up front - resumable (skips regions already
+    # cached from a prior interrupted run) and batched (faster than one
+    # separate_batch call per region). The splice/concatenation logic below
+    # is then just bookkeeping over the results, which stays cheap to redo.
+    if cache_dir:
+        all_voices = separate_regions_resumable(audio, sample_rate, regions, separator, cache_dir)
+    else:
+        all_voices = [separate_overlap_clip(audio, sample_rate, r["start"], r["end"], separator) for r in regions]
+
+    out_chunks = []
+    cursor = 0.0  # position in ORIGINAL audio we've copied up to, in seconds
+    out_len_sec = 0.0  # running length of OUTPUT audio built so far, in seconds
+
+    for region, precomputed_voices in zip(regions, all_voices):
+        r_start, r_end = region["start"], region["end"]
+        if r_start < cursor:
+            print(f"[!] skipping overlapping/out-of-order region {r_start:.2f}-{r_end:.2f} "
+                  f"(cursor already at {cursor:.2f})")
+            continue
+
+        # 1. copy untouched audio from cursor up to this region, unchanged
+        gap_start_sample = int(cursor * sample_rate)
+        gap_end_sample = int(r_start * sample_rate)
+        if gap_end_sample > gap_start_sample:
+            gap = audio[gap_start_sample:gap_end_sample]
+            out_chunks.append(gap)
+            out_len_sec += len(gap) / sample_rate
+
+        # 2. splice in the (already-separated, possibly cached) voices sequentially
+        voices = precomputed_voices
+        if not voices:
+            # separation failed/too short - just pass the original mixed audio through untouched
+            raw_start_sample = int(r_start * sample_rate)
+            raw_end_sample = int(r_end * sample_rate)
+            raw = audio[raw_start_sample:raw_end_sample]
+            out_chunks.append(raw)
+            out_len_sec += len(raw) / sample_rate
+            cursor = r_end
+            continue
+
+        spliced_start = out_len_sec
+        for voice in voices:
+            out_chunks.append(voice)
+            out_len_sec += len(voice) / sample_rate
+        spliced_end = out_len_sec
+
+        manifest["splices"].append({
+            "original_start": r_start,
+            "original_end": r_end,
+            "spliced_start": spliced_start,
+            "spliced_end": spliced_end,
+            "num_voices": len(voices),
+        })
+
+        cursor = r_end
+
+    # 3. copy whatever's left after the last region
+    tail_start_sample = int(cursor * sample_rate)
+    if tail_start_sample < len(audio):
+        out_chunks.append(audio[tail_start_sample:])
+
+    new_audio = np.concatenate(out_chunks) if out_chunks else audio.copy()
+    return new_audio, manifest
+
+
+def spliced_time_to_original(t: float, manifest: dict) -> float:
+    """Reverse-maps a single timestamp `t` (in the SPLICED audio's
+    timeline - e.g. a segment start/end coming back from your diarizer or
+    transcriber, which ran on the spliced audio) back to the equivalent
+    timestamp in the ORIGINAL audio's timeline.
+
+    Call this on every segment boundary you get back from diarization/
+    transcription before writing the final txt/srt.
+    """
+    cumulative_delta = 0.0  # how much longer spliced audio is than original, up to this point
+    for splice in manifest["splices"]:
+        s_start, s_end = splice["spliced_start"], splice["spliced_end"]
+        o_start, o_end = splice["original_start"], splice["original_end"]
+        original_region_dur = o_end - o_start
+        num_voices = splice["num_voices"]
+
+        if t < s_start:
+            # t is before this splice entirely - no more deltas apply, we're done
+            return t - cumulative_delta
+
+        if s_start <= t < s_end:
+            # t falls inside this spliced (multi-voice) region.
+            # Figure out which voice-chunk it's in, then map that chunk's
+            # internal offset straight back onto the original region -
+            # every voice chunk represents the SAME original time window.
+            offset_into_splice = t - s_start
+            voice_idx = min(int(offset_into_splice // original_region_dur), num_voices - 1)
+            offset_into_voice = offset_into_splice - (voice_idx * original_region_dur)
+            offset_into_voice = min(offset_into_voice, original_region_dur)
+            return o_start + offset_into_voice
+
+        # t is past this splice - accumulate its added duration and keep going
+        inserted = (s_end - s_start) - original_region_dur
+        cumulative_delta += inserted
+
+    # t is after every splice
+    return t - cumulative_delta
+
+
+def remap_segments_to_original(segments: list, manifest: dict) -> list:
+    """Convenience wrapper: takes transcript segments in the SPLICED
+    timeline (e.g. [{"start", "end", "speaker", "text"}, ...] straight out
+    of your diarize -> chunk -> transcribe steps) and returns the same
+    list with "start"/"end" rewritten back into the ORIGINAL timeline,
+    ready to compile into a final txt/srt. Sorted by original start time.
+    """
+    remapped = []
+    for seg in segments:
+        new_seg = dict(seg)
+        new_seg["start"] = spliced_time_to_original(seg["start"], manifest)
+        new_seg["end"] = spliced_time_to_original(seg["end"], manifest)
+        remapped.append(new_seg)
+    remapped.sort(key=lambda s: s["start"])
+    return remapped
+
+
+def separate_and_transcribe_overlaps(
+    audio: np.ndarray,
+    sample_rate: int,
+    overlaps: list,
+    separator,
+    transcribe_fn,
+) -> list:
+    """Convenience all-in-one: separates every overlap region and runs
+    `transcribe_fn(voice_audio: np.ndarray) -> str` on each resulting voice.
+
+    Returns list of {"start", "end", "speakers": (a,b), "texts": [str, ...]}
+    - one entry per overlap region, texts in the same order as the
+      separated voices (order is NOT guaranteed to correspond to
+      speakers[0]/speakers[1] - SepFormer doesn't preserve speaker identity,
+      it just gives you N separated streams).
+    """
+    results = []
+    for idx, ov in enumerate(overlaps, start=1):
+        print(f"[+] overlap {idx}/{len(overlaps)}: {ov['start']:.2f}s-{ov['end']:.2f}s "
+              f"({ov['speakers'][0]} + {ov['speakers'][1]})")
+        voices = separate_overlap_clip(audio, sample_rate, ov["start"], ov["end"], separator)
+        if not voices:
+            continue
+        texts = []
+        for voice_audio in voices:
+            try:
+                text = (transcribe_fn(voice_audio) or "").strip()
+            except Exception as e:
+                print(f"    [!] transcribe_fn failed on a separated voice ({e})")
+                text = ""
+            if text:
+                texts.append(text)
+        if texts:
+            results.append({"start": ov["start"], "end": ov["end"], "speakers": ov["speakers"], "texts": texts})
+    return results
+
+# --- end inlined sepformer_overlap core ---
+
+
+def _load_wav_mono_float32(path: str, target_sr: int = 16000):
+    """Load a WAV as mono float32 numpy."""
+    import numpy as np
+    try:
+        import soundfile as sf
+        data, sr = sf.read(path, dtype="float32", always_2d=False)
+        if data.ndim > 1:
+            data = data.mean(axis=1)
+        if sr != target_sr:
+            duration = len(data) / float(sr)
+            new_len = int(duration * target_sr)
+            x_old = np.linspace(0.0, 1.0, num=len(data), endpoint=False)
+            x_new = np.linspace(0.0, 1.0, num=new_len, endpoint=False)
+            data = np.interp(x_new, x_old, data).astype(np.float32)
+            sr = target_sr
+        return data.astype(np.float32), sr
+    except Exception:
+        from pydub import AudioSegment
+        seg = AudioSegment.from_file(path)
+        seg = seg.set_channels(1).set_frame_rate(target_sr)
+        samples = np.array(seg.get_array_of_samples()).astype(np.float32)
+        if seg.sample_width == 2:
+            samples /= 32768.0
+        elif seg.sample_width == 4:
+            samples /= 2147483648.0
+        return samples, target_sr
+
+
+def detect_overlap_regions_osd(audio_path: str, hf_token: str, min_duration_on: float = 0.3,
+                               min_duration_off: float = 0.1) -> list:
+    """Run pyannote OverlappedSpeechDetection (no speaker IDs).
+    Returns list of {"start": float, "end": float}."""
+    import torch
+    from pyannote.audio import Model
+    try:
+        from pyannote.audio.pipelines import OverlappedSpeechDetection
+    except ImportError:
+        raise RuntimeError(
+            "OverlappedSpeechDetection not available in this pyannote.audio version. "
+            "Upgrade pyannote.audio or skip overlap resolution."
+        )
+
+    print("[+] Loading overlapped-speech detection (pyannote/segmentation-3.0)...")
+    try:
+        try:
+            seg_model = Model.from_pretrained("pyannote/segmentation-3.0", token=hf_token)
+        except TypeError:
+            seg_model = Model.from_pretrained("pyannote/segmentation-3.0", use_auth_token=hf_token)
+    except Exception as e:
+        raise RuntimeError(
+            f"Could not load pyannote/segmentation-3.0 ({e}). "
+            "Accept access at https://huggingface.co/pyannote/segmentation-3.0"
+        ) from e
+
+    osd = OverlappedSpeechDetection(segmentation=seg_model)
+    osd.instantiate({
+        "min_duration_on": min_duration_on,
+        "min_duration_off": min_duration_off,
+    })
+    if torch.cuda.is_available():
+        osd.to(torch.device("cuda"))
+
+    try:
+        annotation = osd(audio_path)
+        regions = []
+        timeline = annotation.get_timeline().support() if hasattr(annotation, "get_timeline") else annotation
+        for segment in timeline:
+            regions.append({"start": float(segment.start), "end": float(segment.end)})
+        regions.sort(key=lambda r: r["start"])
+        print(f"[+] OSD found {len(regions)} overlap region(s).")
+        return regions
+    finally:
+        del osd, seg_model
+        free_memory(aggressive=True)
+
+
+def resolve_overlaps_before_diarization(clean_path: str, hf_token: str) -> tuple:
+    """Pre-diarization: OSD → SepFormer splice → return (wav_path, splice_manifest|None)."""
+    try:
+        regions = detect_overlap_regions_osd(clean_path, hf_token)
+    except Exception as e:
+        print(f"[!] Overlap detection failed ({e}). Continuing without SepFormer.")
+        return clean_path, None
+
+    if not regions:
+        print("[+] No overlapping speech detected — skipping SepFormer.")
+        return clean_path, None
+
+    print(f"[+] Separating {len(regions)} overlap region(s) with SepFormer and splicing...")
+    audio_np, sr = _load_wav_mono_float32(clean_path, target_sr=SAMPLE_RATE)
+    basename = os.path.splitext(os.path.basename(clean_path))[0]
+    # Per-file cache dir: survives a crash/disconnect so a retry only
+    # separates whatever regions weren't finished yet. Only wiped below once
+    # the splice fully succeeds - left in place on any failure so the next
+    # attempt can resume instead of starting over.
+    region_cache_dir = os.path.join(NORMALIZED_DIR, f"{basename}_sepformer_cache")
+    try:
+        import torch
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        separator = get_separator_model(device=device)
+        new_audio, splice_manifest = splice_overlaps_into_audio(
+            audio_np, sr, regions, separator, cache_dir=region_cache_dir
+        )
+    except Exception as e:
+        print(f"[!] SepFormer splice failed ({e}). Continuing on original audio.")
+        print(f"    (Partial progress kept in {region_cache_dir} - rerun to resume.)")
+        return clean_path, None
+    finally:
+        try:
+            unload_separator_model()
+        except Exception:
+            pass
+        free_memory(aggressive=True)
+
+    if not splice_manifest or not splice_manifest.get("splices"):
+        print("[+] SepFormer produced no splices — using original audio.")
+        return clean_path, None
+
+    spliced_path = os.path.join(NORMALIZED_DIR, f"{basename}_spliced.wav")
+    try:
+        import soundfile as sf
+        sf.write(spliced_path, new_audio, sr, subtype="PCM_16")
+    except Exception:
+        from pydub import AudioSegment
+        import numpy as np
+        pcm = (np.clip(new_audio, -1.0, 1.0) * 32767.0).astype(np.int16)
+        seg = AudioSegment(pcm.tobytes(), frame_rate=sr, sample_width=2, channels=1)
+        seg.export(spliced_path, format="wav")
+
+    # Splice succeeded end-to-end - the per-region cache has done its job, drop it.
+    shutil.rmtree(region_cache_dir, ignore_errors=True)
+
+    n_splices = len(splice_manifest["splices"])
+    dur_orig = len(audio_np) / float(sr)
+    dur_new = len(new_audio) / float(sr)
+    print(f"[OK] Spliced audio written: {spliced_path}")
+    print(f"     {n_splices} region(s) separated | "
+          f"duration {dur_orig/60:.1f} min → {dur_new/60:.1f} min (spliced timeline)")
+    print(f"     Timestamps will be remapped back to the original timeline on REASSEMBLE.")
+    return spliced_path, splice_manifest
+
+
+def remap_entries_to_original(entries: list, splice_manifest: dict) -> list:
+    """Transcript compiler: spliced timeline → original timeline."""
+    remapped = remap_segments_to_original(entries, splice_manifest)
+    for e in remapped:
+        e["start"] = round(float(e["start"]), 3)
+        e["end"] = round(float(e["end"]), 3)
+        if e["end"] < e["start"]:
+            e["end"] = e["start"]
+    return remapped
+
+
+def split_file(audio_path: str, merge_gap: float, min_segment: float, do_langid: bool, hf_token: str,
+               write_segment_wavs: bool = None, resolve_overlaps: bool = False):
+    """Diarize and write a lightweight manifest of timestamps.
+    By default does NOT write per-turn WAV files (they are reconstructed later
+    from the normalized full audio using the timestamps). Set write_segment_wavs=True
+    (or the global WRITE_SEGMENT_WAVS) if you still want the old behaviour.
+
+    Memory notes (Colab-critical):
+    - Never loads the full normalized audio into pydub unless permanent WAVs are
+      requested. Language-ID uses short-lived ffmpeg slices only.
+    - Unloads the langid model after the loop so its RAM/VRAM is free before
+      the next file (or before TRANSCRIBE starts).
+    """
+    if write_segment_wavs is None:
+        write_segment_wavs = WRITE_SEGMENT_WAVS
+
+    # Normalize first so pyannote never sees the original OGG/MP3 (stays local)
+    clean_path = normalize_audio_for_diarization(audio_path)
+    original_normalized = clean_path
+    splice_manifest = None
+
+    # Optional: separate overlapping speech BEFORE diarization (easier + cleaner)
+    if resolve_overlaps:
+        clean_path, splice_manifest = resolve_overlaps_before_diarization(clean_path, hf_token)
+        # clean_path may now be the longer spliced WAV; diarize that
+
+    turns = run_diarization(clean_path, hf_token)
+    turns = merge_and_filter(turns, merge_gap, min_segment)
+    if not turns:
+        print(f"[!] No speaker turns detected in '{audio_path}'. Skipping.")
+        return None
+
+    print(f"[+] {len(turns)} speaker turn(s) after merge/filter"
+          f"{' (on spliced timeline)' if splice_manifest else ''}.")
+
+    basename = os.path.splitext(os.path.basename(audio_path))[0]
+    out_dir = os.path.join(SEGMENTS_ROOT, basename)
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Only load full audio into memory if we actually write permanent WAVs
+    audio = None
+    if write_segment_wavs:
+        from pydub import AudioSegment
+        print("[+] Loading normalized audio to write permanent per-turn WAVs...")
+        audio = AudioSegment.from_file(clean_path)
+
+    manifest = {
+        "source_file": os.path.abspath(audio_path),
+        "normalized_audio": clean_path,  # may be spliced — used for slice reconstruction
+        "original_normalized_audio": original_normalized,
+        "splice_manifest": splice_manifest,  # None if overlaps were not resolved
+        "segments": [],
+    }
+
+    try:
+        for i, (start_sec, end_sec, speaker) in enumerate(turns, start=1):
+            seg_filename = f"seg_{i:04d}_{speaker}.wav"
+            seg_path = os.path.join(out_dir, seg_filename) if write_segment_wavs else None
+
+            if write_segment_wavs and audio is not None:
+                audio[int(start_sec * 1000):int(end_sec * 1000)].export(seg_path, format="wav")
+
+            language, language_prob = (None, None)
+            if do_langid:
+                try:
+                    if write_segment_wavs and seg_path and os.path.exists(seg_path):
+                        language, language_prob = detect_language(seg_path)
+                    else:
+                        # Extract a short-lived temp slice via ffmpeg (never holds full audio)
+                        tmp_slice = os.path.join(TEMP_SLICES_DIR, f"langid_{basename}_{i:04d}.wav")
+                        extract_segment_slice(clean_path, start_sec, end_sec, out_path=tmp_slice)
+                        language, language_prob = detect_language(tmp_slice)
+                        try:
+                            os.remove(tmp_slice)
+                        except OSError:
+                            pass
+                except Exception as e:
+                    print(f"[!] Language ID failed on segment {i}: {e}")
+
+            manifest["segments"].append({
+                "index": i,
+                "file": seg_filename,               # kept for transcript naming compatibility
+                "speaker": speaker,
+                "start_sec": round(start_sec, 3),
+                "end_sec": round(end_sec, 3),
+                "language": language,
+                "language_prob": language_prob,
+            })
+
+            lang_note = f", lang={language} ({language_prob})" if language else ""
+            wav_note = " [WAV written]" if write_segment_wavs else ""
+            print(f"  [{i}/{len(turns)}] {seg_filename}  {start_sec:.2f}s-{end_sec:.2f}s  {speaker}{lang_note}{wav_note}")
+    finally:
+        # Release the optional full-audio buffer + language-ID model immediately
+        if audio is not None:
+            del audio
+        unload_langid_model()
+        free_memory(aggressive=True)
+
+    manifest_path = os.path.join(out_dir, "manifest.json")
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2)
+
+    if write_segment_wavs:
+        print(f"[SUCCESS] Per-turn WAVs + manifest written to: {out_dir}")
+    else:
+        print(f"[SUCCESS] Lightweight manifest written to: {out_dir}")
+        print(f"          (no permanent per-turn WAVs – will reconstruct from normalized audio on demand)")
+    return manifest_path
+
+
+def ensure_normalized_audio(manifest: dict) -> str:
+    """Return a usable path to the normalized full audio.
+    Prefers the path stored in the manifest; if missing, re-normalizes from source_file."""
+    norm = manifest.get("normalized_audio")
+    if norm and os.path.exists(norm) and os.path.getsize(norm) > 0:
+        return norm
+
+    source = manifest.get("source_file")
+    if source and os.path.exists(source):
+        print("[+] Normalized audio missing – re-creating from source_file...")
+        return normalize_audio_for_diarization(source)
+
+    raise FileNotFoundError(
+        "Neither normalized_audio nor source_file is available. "
+        "Cannot reconstruct segments. Re-run SPLIT mode."
+    )
+
+
+def extract_segment_slice(normalized_path: str, start_sec: float, end_sec: float,
+                          out_path: str = None) -> str:
+    """Cut [start_sec:end_sec] from the normalized full audio into a short-lived temp file.
+    Returns the path to the temp slice. Caller is responsible for deleting it after use.
+    Prefer ffmpeg (no full-file RAM load). pydub fallback only if ffmpeg fails."""
+    if out_path is None:
+        os.makedirs(TEMP_SLICES_DIR, exist_ok=True)
+        out_path = os.path.join(
+            TEMP_SLICES_DIR,
+            f"slice_{int(start_sec*1000)}_{int(end_sec*1000)}_{os.getpid()}.wav"
+        )
+
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-y",
+                "-ss", str(start_sec),
+                "-to", str(end_sec),
+                "-i", normalized_path,
+                "-ac", "1", "-ar", "16000", "-sample_fmt", "s16",
+                out_path,
+            ],
+            check=True, capture_output=True,
+        )
+    except Exception:
+        # Last-resort: load only the needed region if possible; still better than
+        # crashing the whole pipeline. Prefer this never runs on Colab.
+        from pydub import AudioSegment
+        audio = AudioSegment.from_file(normalized_path)
+        audio[int(start_sec * 1000):int(end_sec * 1000)].export(out_path, format="wav")
+        del audio
+        free_memory()
+
+    return out_path
+
+
+def get_segment_audio_path(manifest: dict, seg: dict, seg_dir: str) -> tuple:
+    """Return (path_to_audio, is_temporary).
+    Prefer an existing permanent WAV (legacy); otherwise reconstruct a temp slice
+    from the normalized full audio using the timestamps in the manifest."""
+    legacy = os.path.join(seg_dir, seg["file"])
+    if os.path.exists(legacy) and os.path.getsize(legacy) > 0:
+        return legacy, False
+
+    norm = ensure_normalized_audio(manifest)
+    tmp = extract_segment_slice(norm, seg["start_sec"], seg["end_sec"])
+    return tmp, True
+
+
+def do_split_mode(prompt_for_settings: bool = True):
+    hf_token = get_hf_token()
+    if not hf_token:
+        print("[!] No Hugging Face token provided. pyannote needs one. Aborting split.")
+        return []
+
+    files = select_audio_files_split()
+    if not files:
+        print("[!] No audio files selected.")
+        return []
+
+    merge_gap, min_segment, do_langid = DEFAULT_MERGE_GAP, DEFAULT_MIN_SEGMENT, True
+    write_wavs = WRITE_SEGMENT_WAVS
+    resolve_overlaps = False
+    if prompt_for_settings:
+        raw = input(f"Merge same-speaker gaps under how many seconds? (default {DEFAULT_MERGE_GAP}): ").strip()
+        merge_gap = float(raw) if raw else DEFAULT_MERGE_GAP
+        raw = input(f"Drop segments shorter than how many seconds? (default {DEFAULT_MIN_SEGMENT}): ").strip()
+        min_segment = float(raw) if raw else DEFAULT_MIN_SEGMENT
+        do_langid = input("Run per-segment language ID? (Y/n): ").strip().lower() != "n"
+        write_wavs = input(
+            "Also write permanent per-turn WAV files? (rarely needed, uses lots of space) (y/N): "
+        ).strip().lower() == "y"
+        resolve_overlaps = input(
+            "Resolve overlapping speech with SepFormer BEFORE diarization?\n"
+            "  (detects crosstalk, separates voices, splices them so diarization sees clean turns;\n"
+            "   timestamps are remapped back to the original timeline on REASSEMBLE) (y/N): "
+        ).strip().lower() == "y"
+
+    manifest_paths = []
+    for f in files:
+        if not os.path.exists(f):
+            print(f"[!] File not found, skipping: {f}")
+            continue
+        mp = split_file(
+            f, merge_gap, min_segment, do_langid, hf_token,
+            write_segment_wavs=write_wavs, resolve_overlaps=resolve_overlaps,
+        )
+        if mp:
+            manifest_paths.append(mp)
+    return manifest_paths
+
+
+# =========================================================================
+# TRANSCRIBE MODE
+# =========================================================================
+def find_transcript_file(seg_filename: str, transcripts_dirs: list):
+    stem = os.path.splitext(seg_filename)[0]
+    for d in transcripts_dirs:
+        groq_path = os.path.join(d, f"{stem}_transcript.txt")
+        if os.path.exists(groq_path):
+            return groq_path, "groq"
+        colab_path = os.path.join(d, f"{stem}.txt")
+        if os.path.exists(colab_path):
+            return colab_path, "colab"
+    return None, None
+
+
+def is_local_transcript_complete(path: str, expected_duration_sec: float, tolerance: float = 0.75) -> bool:
+    """True if a local (faster-whisper) transcript appears to cover the whole segment.
+    Local files use relative timestamps starting at ~0.0 for the slice, so the
+    last end-time should be close to the segment duration. Empty / non-timestamped
+    / truncated files are treated as incomplete."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read().strip()
+    except OSError:
+        return False
+    if not content:
+        return False
+    ends = [float(m.group(2)) for m in COLAB_LINE_RE.finditer(content)]
+    if not ends:
+        # No timestamp lines at all (corrupt / hand-edited / empty progress) → incomplete
+        return False
+    last_end = max(ends)
+    return last_end >= (expected_duration_sec - tolerance)
+
+
+def cleanup_incomplete_local_transcripts(manifest: dict, transcripts_dirs: list) -> int:
+    """When switching to Groq (or any non-local backend), remove partial local
+    faster-whisper transcripts so those segments are treated as missing and
+    get re-transcribed cleanly. Also clears matching entries from
+    local_resume_state.json.
+
+    Returns the number of partial files removed."""
+    state = load_local_resume_state()
+    removed = 0
+    keys_to_drop = []
+
+    for seg in manifest.get("segments", []):
+        stem = os.path.splitext(seg["file"])[0]
+        expected_dur = float(seg["end_sec"]) - float(seg["start_sec"])
+
+        for d in transcripts_dirs:
+            local_path = os.path.join(d, f"{stem}.txt")
+            if not os.path.exists(local_path):
+                continue
+            # Already have a finished Groq transcript? Leave the local one alone.
+            groq_path = os.path.join(d, f"{stem}_transcript.txt")
+            if os.path.exists(groq_path):
+                continue
+
+            if is_local_transcript_complete(local_path, expected_dur):
+                continue
+
+            # Incomplete → delete so Groq (or a fresh local run) will redo it
+            try:
+                os.remove(local_path)
+                removed += 1
+                print(f"  [~] Removed incomplete local transcript: {os.path.basename(local_path)} "
+                      f"(will be re-transcribed by the new backend)")
+            except OSError as e:
+                print(f"  [!] Could not remove partial {local_path}: {e}")
+                continue
+
+            # Drop any resume-state keys that point at this stem / path
+            for k in list(state.keys()):
+                if stem in k or k == local_path or k.endswith(f"{stem}.txt"):
+                    keys_to_drop.append(k)
+
+    for k in keys_to_drop:
+        state.pop(k, None)
+    if keys_to_drop:
+        save_local_resume_state(state)
+
+    return removed
+
+
+def export_flac_under_limit(seg_path: str, tmp_path: str) -> str:
+    from pydub import AudioSegment
+    audio = AudioSegment.from_file(seg_path)
+    try:
+        audio.export(tmp_path, format="flac")
+        if os.path.getsize(tmp_path) <= MAX_CHUNK_BYTES:
+            return tmp_path
+        print(f"[!] '{seg_path}' exceeds Groq's size limit even as FLAC - truncating to first half.")
+        half = audio[:len(audio) // 2]
+        half.export(tmp_path, format="flac")
+        return tmp_path
+    finally:
+        del audio
+
+
+def transcribe_segment_groq(client_holder: dict, api_keys: list, seg_path: str, model_id: str,
+                            prompt_context: str, fixed_language: str = None, lock: threading.Lock = None):
+    """Returns (text, detected_lang). client_holder = {'client': Groq, 'key_index': int},
+    mutated in place so key rotation persists across calls within one run.
+    Optional lock makes this safe under ThreadPoolExecutor."""
+    tmp_path = seg_path + f".groqtmp.{os.getpid()}.{threading.get_ident()}.flac"
+    export_flac_under_limit(seg_path, tmp_path)
+
+    kwargs = {
+        "model": model_id,
+        "response_format": "verbose_json",
+        "prompt": prompt_context[-CONTEXT_CHARS:] if prompt_context else None,
+    }
+    # Groq Whisper accepts language as ISO-639-1 when you want to pin it
+    if fixed_language:
+        kwargs["language"] = fixed_language
+
+    while True:
+        try:
+            with open(tmp_path, "rb") as audio_file:
+                data = audio_file.read()
+            # Hold lock only around the API call + key rotation, not file I/O
+            def _call():
+                return client_holder["client"].audio.transcriptions.create(
+                    file=(os.path.basename(tmp_path), data),
+                    **kwargs,
+                )
+            if lock:
+                with lock:
+                    response = _call()
+            else:
+                response = _call()
+            text = response.text.strip()
+            lang = getattr(response, "language", None) or fixed_language
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            return text, lang
+
+        except Exception as e:
+            if is_quota_or_rate_limit_error(e):
+                print(f"[!] Key '{client_holder['key_index']+1}' hit a rate limit/quota error: {e}")
+                time.sleep(RATE_LIMIT_COOLDOWN_SEC)
+                if lock:
+                    lock.acquire()
+                try:
+                    client_holder["key_index"] += 1
+                    if client_holder["key_index"] >= len(api_keys):
+                        if os.path.exists(tmp_path):
+                            os.remove(tmp_path)
+                        raise RuntimeError("All available Groq API keys are exhausted for now.")
+                    print(f"[+] Switching to key {client_holder['key_index']+1}/{len(api_keys)}...")
+                    from groq import Groq
+                    client_holder["client"] = Groq(api_key=api_keys[client_holder["key_index"]])
+                finally:
+                    if lock:
+                        lock.release()
+                continue
+            else:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+                raise
+
+
+_transcribe_model_cache = {}
+
+
+def get_transcribe_model(style: str):
+    """style: 'turbo' or 'large'. Mirrors the original Colab script's GPU/T4-
+    aware model + quantization selection exactly, with a CPU fallback to
+    'small'/int8 regardless of style (same as the original)."""
+    import torch
+
+    cache_key = style
+    if cache_key in _transcribe_model_cache:
+        return _transcribe_model_cache[cache_key]
+
+    from faster_whisper import WhisperModel
+
+    if torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_name(0)
+        print(f"[+] GPU detected ({gpu_name}).")
+        is_t4 = "T4" in gpu_name
+        if style == "turbo":
+            if is_t4:
+                print("[+] T4 detected - using int8_float16 quantization on 'medium' for better speed...")
+                model = WhisperModel("medium", device="cuda", compute_type="int8_float16")
+            else:
+                print("[+] Loading faster-whisper on GPU (int8_float16, large-v3-turbo)...")
+                model = WhisperModel("large-v3-turbo", device="cuda", compute_type="int8_float16")
+        else:  # large - full accuracy
+            if is_t4:
+                print("[+] T4 detected - using int8_float16 quantization on large-v3 (full accuracy, slower)...")
+                model = WhisperModel("large-v3", device="cuda", compute_type="int8_float16")
+            else:
+                print("[+] Loading faster-whisper on GPU (float16, large-v3)...")
+                model = WhisperModel("large-v3", device="cuda", compute_type="float16")
+    else:
+        print("[!] CPU-only (no GPU attached). Loading faster-whisper 'small' (int8) regardless of style chosen.")
+        model = WhisperModel("small", device="cpu", compute_type="int8")
+
+    _transcribe_model_cache[cache_key] = model
+    return model
+
+
+def load_local_resume_state() -> dict:
+    if not os.path.exists(LOCAL_RESUME_FILE):
+        return {}
+    try:
+        with open(LOCAL_RESUME_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_local_resume_state(state: dict):
+    with open(LOCAL_RESUME_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2)
+
+
+def transcribe_segment_local(model, seg_path: str, out_path: str, initial_prompt: str,
+                             fixed_language: str = None):
+    """Writes '[start -> end] text' lines to out_path progressively (flush +
+    fsync per line), and tracks a resume state on Drive keyed by the stable
+    transcript path (out_path) so mid-segment resume still works when audio
+    is reconstructed from different temp slice paths each run.
+
+    If a prior run was interrupted mid-segment, seeks past the completed
+    portion via ffmpeg (exact re-encode seek, same technique as the original
+    Colab script - not '-c copy', which snaps to the nearest keyframe) and
+    continues appending rather than restarting the whole segment. Returns the
+    full segment text and the last detected language.
+
+    fixed_language: ISO code (e.g. 'en') forces that language — no per-segment
+    redetect / switch. None = auto-detect.
+    """
+    state = load_local_resume_state()
+    # Prefer stable transcript-path key; fall back to legacy audio-path key
+    entry = state.get(out_path) or state.get(seg_path) or {"last_end": 0.0, "done": False}
+
+    if entry.get("done") and os.path.exists(out_path):
+        with open(out_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        lines = [m.group(3) for m in COLAB_LINE_RE.finditer(content)] if content else []
+        return " ".join(lines).strip(), fixed_language
+
+    resume_offset = float(entry.get("last_end", 0.0))
+    process_path = seg_path
+    if resume_offset > 0:
+        resume_tmp = seg_path + ".resume.wav"
+        try:
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", seg_path, "-ss", str(resume_offset), resume_tmp],
+                check=True, capture_output=True,
+            )
+            process_path = resume_tmp
+            print(f"    [+] Resuming this segment from {resume_offset:.2f}s (previous run was interrupted).")
+        except Exception as e:
+            print(f"    [!] Couldn't seek to resume point ({e}) - restarting this segment from scratch.")
+            resume_offset = 0.0
+            process_path = seg_path
+
+    mode = "a" if resume_offset > 0 else "w"
+    segments, info = model.transcribe(
+        process_path,
+        beam_size=1,
+        language=fixed_language,  # None = auto; set = stick to one language
+        vad_filter=True,          # skip pure silence → faster
+        condition_on_previous_text=False,
+        initial_prompt=initial_prompt[-CONTEXT_CHARS:] if initial_prompt else None,
+    )
+
+    all_text = []
+    with open(out_path, mode, encoding="utf-8") as f_out:
+        for seg in segments:
+            start, end = seg.start + resume_offset, seg.end + resume_offset
+            text = seg.text.strip()
+            all_text.append(text)
+            f_out.write(f"[{start:.2f}s -> {end:.2f}s] {text}\n")
+            f_out.flush()
+            os.fsync(f_out.fileno())
+
+            entry["last_end"] = end
+            # Always write under the stable transcript path
+            state[out_path] = entry
+            # Drop any legacy audio-path key so state stays clean
+            if seg_path in state and seg_path != out_path:
+                state.pop(seg_path, None)
+            save_local_resume_state(state)
+
+    entry["done"] = True
+    state[out_path] = entry
+    if seg_path in state and seg_path != out_path:
+        state.pop(seg_path, None)
+    save_local_resume_state(state)
+
+    if process_path != seg_path and os.path.exists(process_path):
+        os.remove(process_path)
+
+    # if we resumed, all_text only has the NEW portion - read the full file back for context purposes
+    if resume_offset > 0:
+        with open(out_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        all_text = [m.group(3) for m in COLAB_LINE_RE.finditer(content)]
+
+    lang = fixed_language or getattr(info, "language", None)
+    return " ".join(all_text).strip(), lang
+
+
+def seed_initial_context(manifest_path: str, transcripts_dirs: list, first_missing_index: int) -> str:
+    """Builds trailing context from whatever segments before the first missing
+    one already have a transcript, so continuity isn't lost just because some
+    segments were done in a prior run or hand-dropped in."""
+    entries, _, _ = build_entries(manifest_path, transcripts_dirs)
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        manifest = json.load(f)
+    cutoff_start = manifest["segments"][first_missing_index]["start_sec"] if first_missing_index < len(manifest["segments"]) else None
+    prior_text = " ".join(e["text"] for e in entries if cutoff_start is None or e["start"] < cutoff_start)
+    return prior_text[-CONTEXT_CHARS:] if prior_text else ""
+
+
+def auto_transcribe_missing(manifest_path: str, transcripts_dirs: list, backend: str, style: str,
+                            fixed_language: str = None, parallel_workers: int = 1) -> int:
+    """Transcribes any segment in the manifest that doesn't already have a
+    transcript file in transcripts_dirs.
+
+    fixed_language: ISO code (e.g. 'en') locks language for the whole run —
+      no switch detection, context never dropped for language reasons.
+    parallel_workers: >1 enables concurrent Groq API calls (big speedup).
+      Local GPU stays sequential (one model); slices are still prefetched.
+
+    Returns count newly transcribed.
+    """
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        manifest = json.load(f)
+
+    seg_dir = os.path.dirname(manifest_path)
+    all_segments = manifest["segments"]
+
+    if backend == "groq":
+        n_cleaned = cleanup_incomplete_local_transcripts(manifest, transcripts_dirs)
+        if n_cleaned:
+            print(f"[+] Cleaned {n_cleaned} incomplete local transcript(s) so Groq can redo them.")
+
+    missing_indices = [
+        i for i, seg in enumerate(all_segments)
+        if find_transcript_file(seg["file"], transcripts_dirs)[0] is None
+    ]
+
+    if not missing_indices:
+        print("[+] Every segment already has a transcript.")
+        return 0
+
+    workers = max(1, int(parallel_workers or 1))
+    # Local Whisper on one GPU cannot usefully parallelize inference
+    if backend == "local" and workers > 1:
+        print("[~] Local GPU transcription stays sequential (one model). "
+              "Parallel workers apply to Groq / slice prefetch only.")
+        workers = 1
+
+    lang_note = f", language={fixed_language}" if fixed_language else ", language=auto"
+    print(f"[+] {len(missing_indices)} segment(s) need transcribing "
+          f"(backend: {backend}, style: {style}{lang_note}, workers: {workers}).")
+
+    unload_langid_model()
+    free_memory(aggressive=True)
+
+    client_holder = None
+    api_keys = []
+    local_model = None
+    model_id = None
+    api_lock = threading.Lock()
+
+    try:
+        if backend == "groq":
+            api_keys = select_groq_keys()
+            from groq import Groq
+            client_holder = {"client": Groq(api_key=api_keys[0]), "key_index": 0}
+            model_id = GROQ_MODEL_IDS[style]
+        else:
+            local_model = get_transcribe_model(style)
+
+        seed_ctx = seed_initial_context(manifest_path, transcripts_dirs, missing_indices[0])
+        stick_lang = bool(fixed_language)
+
+        # ---------- PARALLEL GROQ PATH ----------
+        if backend == "groq" and workers > 1:
+            print(f"[+] Parallel Groq mode ({workers} workers). "
+                  "Cross-segment context uses seed only (speed > sequential continuity).")
+
+            def _work(n_idx_pair):
+                n, idx = n_idx_pair
+                seg = all_segments[idx]
+                stem = os.path.splitext(seg["file"])[0]
+                seg_path, is_temp = get_segment_audio_path(manifest, seg, seg_dir)
+                try:
+                    print(f"  [{n}/{len(missing_indices)}] Transcribing {seg['file']} "
+                          f"({seg['start_sec']:.2f}s-{seg['end_sec']:.2f}s) (groq/{style})...")
+                    text, lang = transcribe_segment_groq(
+                        client_holder, api_keys, seg_path, model_id, seed_ctx,
+                        fixed_language=fixed_language, lock=api_lock,
+                    )
+                    out_path = os.path.join(DEFAULT_TRANSCRIPTS_DIR, f"{stem}_transcript.txt")
+                    with open(out_path, "w", encoding="utf-8") as f:
+                        f.write(text)
+                    return idx, text, lang or fixed_language, None
+                except Exception as e:
+                    return idx, None, None, e
+                finally:
+                    if is_temp and seg_path and os.path.exists(seg_path):
+                        try:
+                            os.remove(seg_path)
+                        except OSError:
+                            pass
+
+            done_count = 0
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futs = {
+                    pool.submit(_work, (n, idx)): idx
+                    for n, idx in enumerate(missing_indices, 1)
+                }
+                for fut in as_completed(futs):
+                    idx, text, lang, err = fut.result()
+                    if err is not None:
+                        print(f"[!] Failed on segment index {idx}: {err}")
+                        continue
+                    if lang:
+                        all_segments[idx]["language"] = lang
+                    done_count += 1
+
+            with open(manifest_path, "w", encoding="utf-8") as f:
+                json.dump(manifest, f, indent=2)
+            return done_count
+
+        # ---------- SEQUENTIAL PATH (local, or Groq workers=1) ----------
+        running_context = seed_ctx
+        last_lang = fixed_language
+        done_count = 0
+
+        for n, idx in enumerate(missing_indices, 1):
+            seg = all_segments[idx]
+            stem = os.path.splitext(seg["file"])[0]
+            print(f"  [{n}/{len(missing_indices)}] Transcribing {seg['file']} "
+                  f"({seg['start_sec']:.2f}s-{seg['end_sec']:.2f}s) ({backend}/{style})...")
+
+            seg_path = None
+            is_temp = False
+            try:
+                seg_path, is_temp = get_segment_audio_path(manifest, seg, seg_dir)
+
+                if backend == "groq":
+                    text, lang = transcribe_segment_groq(
+                        client_holder, api_keys, seg_path, model_id, running_context,
+                        fixed_language=fixed_language, lock=None,
+                    )
+                    out_path = os.path.join(DEFAULT_TRANSCRIPTS_DIR, f"{stem}_transcript.txt")
+                    with open(out_path, "w", encoding="utf-8") as f:
+                        f.write(text)
+                else:
+                    out_path = os.path.join(DEFAULT_TRANSCRIPTS_DIR, f"{stem}.txt")
+                    text, lang = transcribe_segment_local(
+                        local_model, seg_path, out_path, running_context,
+                        fixed_language=fixed_language,
+                    )
+
+                # Language-switch context drop — skipped when language is pinned
+                if (not stick_lang) and lang and last_lang and lang != last_lang:
+                    print(f"    [~] Language switch detected: '{last_lang}' -> '{lang}' "
+                          f"(dropping context for continuity)")
+                    running_context = ""
+                else:
+                    running_context = (running_context + " " + text).strip()
+                if lang:
+                    last_lang = lang
+                    seg["language"] = lang
+
+                done_count += 1
+
+            except Exception as e:
+                print(f"[!] Failed to transcribe {seg['file']}: {e}")
+                print("    Progress so far is saved — rerun to continue.")
+                break
+            finally:
+                if is_temp and seg_path and os.path.exists(seg_path):
+                    try:
+                        os.remove(seg_path)
+                    except OSError:
+                        pass
+                # Light GC only every 15 segments — prioritise speed over peak-RAM shaving
+                if n % 15 == 0:
+                    free_memory()
+
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            json.dump(manifest, f, indent=2)
+
+        return done_count
+    finally:
+        if backend == "local":
+            unload_transcribe_models()
+        free_memory(aggressive=True)
+
+
+def prompt_backend_choice() -> tuple:
+    """Returns (backend, style, fixed_language|None, parallel_workers)."""
+    print("\nWhich transcription backend?")
+    print("  1. Groq API (needs API key(s), rate-limited) — best with parallel workers")
+    print("  2. Local/Colab faster-whisper (uses GPU if available, no API key)")
+    raw = input("Choose 1 or 2 (default 1): ").strip()
+    backend = "local" if raw == "2" else "groq"
+
+    print("\nWhich model style?")
+    print("  1. turbo    - faster")
+    print("  2. large-v3 - slower, max accuracy")
+    raw2 = input("Choose 1 or 2 (default 1): ").strip()
+    style = "large" if raw2 == "2" else "turbo"
+
+    print("\nLanguage mode:")
+    print("  - Press Enter for AUTO (detect per segment; may drop context on language switches)")
+    print("  - Or type a code to LOCK one language for the whole run (e.g. en, es, ja, zh, pt)")
+    lang_raw = input("Language (default auto): ").strip().lower()
+    fixed_language = lang_raw if lang_raw else None
+    if fixed_language:
+        print(f"[+] Locked language: {fixed_language} (no switch detection)")
+
+    workers = 1
+    if backend == "groq":
+        raw_w = input(
+            "Parallel Groq workers? (1 = sequential with full context, "
+            "4–8 = much faster, default 4): "
+        ).strip()
+        try:
+            workers = int(raw_w) if raw_w else 4
+        except ValueError:
+            workers = 4
+        workers = max(1, min(workers, 16))
+    else:
+        print("[+] Local mode: sequential GPU inference (fastest for a single model).")
+
+    return backend, style, fixed_language, workers
+
+
+def resolve_manifest_choice() -> str:
+    manifests = sorted(glob.glob(os.path.join(SEGMENTS_ROOT, "*", "manifest.json")))
+    if manifests:
+        print("\n[+] Found manifest(s) under Drive segments folder:")
+        for i, m in enumerate(manifests, 1):
+            print(f"  {i}. {m}")
+        raw = input("Pick a number, or paste a manifest.json path directly: ").strip()
+        if raw.isdigit() and 1 <= int(raw) <= len(manifests):
+            return manifests[int(raw) - 1]
+        return raw
+    return input("Path to manifest.json: ").strip()
+
+
+def do_transcribe_mode(manifest_path: str = None):
+    manifest_path = manifest_path or resolve_manifest_choice()
+    if not os.path.exists(manifest_path):
+        print(f"[!] Manifest not found: {manifest_path}")
+        return
+    backend, style, fixed_language, workers = prompt_backend_choice()
+    transcripts_dirs = [DEFAULT_TRANSCRIPTS_DIR, os.path.dirname(manifest_path), os.getcwd()]
+    n = auto_transcribe_missing(
+        manifest_path, transcripts_dirs, backend, style,
+        fixed_language=fixed_language, parallel_workers=workers,
+    )
+    print(f"[+] Transcribed {n} segment(s).")
+
+
+# =========================================================================
+# REASSEMBLE MODE
+# =========================================================================
+def parse_transcript(path: str, fmt: str, seg_start_sec: float, seg_end_sec: float):
+    with open(path, "r", encoding="utf-8") as f:
+        content = f.read().strip()
+    if not content:
+        return []
+
+    if fmt == "colab":
+        lines_out = []
+        matched_any = False
+        for line in content.splitlines():
+            m = COLAB_LINE_RE.match(line.strip())
+            if m:
+                matched_any = True
+                rel_start, rel_end, text = float(m.group(1)), float(m.group(2)), m.group(3)
+                lines_out.append((seg_start_sec + rel_start, seg_start_sec + rel_end, text))
+        if matched_any:
+            return lines_out
+        return [(seg_start_sec, seg_end_sec, content)]
+
+    return [(seg_start_sec, seg_end_sec, content)]
+
+
+def format_srt_timestamp(seconds: float) -> str:
+    ms = int(round(seconds * 1000))
+    h, ms = divmod(ms, 3_600_000)
+    m, ms = divmod(ms, 60_000)
+    s, ms = divmod(ms, 1000)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def build_entries(manifest_path: str, transcripts_dirs: list):
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        manifest = json.load(f)
+
+    entries = []
+    missing_count = 0
+
+    for seg in manifest["segments"]:
+        path, fmt = find_transcript_file(seg["file"], transcripts_dirs)
+
+        if path is None:
+            missing_count += 1
+            entries.append({
+                "start": seg["start_sec"], "end": seg["end_sec"], "speaker": seg["speaker"],
+                "language": seg.get("language"), "text": "[MISSING TRANSCRIPT]", "source_segment": seg["file"],
+            })
+            continue
+
+        for abs_start, abs_end, text in parse_transcript(path, fmt, seg["start_sec"], seg["end_sec"]):
+            text = text.strip()
+            if not text:
+                continue
+            entries.append({
+                "start": round(abs_start, 3), "end": round(abs_end, 3), "speaker": seg["speaker"],
+                "language": seg.get("language"), "text": text, "source_segment": seg["file"],
+            })
+
+    entries.sort(key=lambda e: e["start"])
+    return entries, manifest, missing_count
+
+
+def write_outputs(entries: list, output_basename: str, source_file: str):
+    txt_path = f"{output_basename}.txt"
+    with open(txt_path, "w", encoding="utf-8") as f:
+        for e in entries:
+            lang_tag = f"[{e['language']}] " if e["language"] else ""
+            f.write(f"[{e['start']:.2f}s - {e['end']:.2f}s] [{e['speaker']}] {lang_tag}{e['text']}\n")
+
+    srt_path = f"{output_basename}.srt"
+    with open(srt_path, "w", encoding="utf-8") as f:
+        for i, e in enumerate(entries, start=1):
+            lang_tag = f"[{e['language']}] " if e["language"] else ""
+            f.write(f"{i}\n{format_srt_timestamp(e['start'])} --> {format_srt_timestamp(e['end'])}\n")
+            f.write(f"[{e['speaker']}] {lang_tag}{e['text']}\n\n")
+
+    json_path = f"{output_basename}.json"
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump({"source_file": source_file, "entries": entries}, f, indent=2)
+
+    print(f"[SUCCESS] Wrote {len(entries)} entrie(s):\n  {txt_path}\n  {srt_path}\n  {json_path}")
+    return txt_path, srt_path, json_path
+
+
+# --- TRANSLATION (deep-translator's GoogleTranslator - free, no API key) ---
+def ensure_translator_installed() -> bool:
+    try:
+        from deep_translator import GoogleTranslator  # noqa: F401
+        return True
+    except ImportError:
+        print("[+] Installing 'deep-translator' for the translation feature...")
+        try:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "deep-translator"])
+            return True
+        except Exception as e:
+            print(f"[!] Could not install deep-translator ({e}). Skipping translation.")
+            return False
+
+
+def prompt_translation_choice():
+    raw = input(
+        "\nWould you also like a translated version of the transcript? "
+        "Enter a target language code (e.g. 'es', 'fr', 'ja'), or press Enter to skip: "
+    ).strip()
+    if not raw:
+        return None
+    if not ensure_translator_installed():
+        return None
+    return raw.lower()
+
+
+def translate_entries(entries: list, target_lang: str) -> list:
+    """Translates each entry's text individually rather than one merged blob -
+    every entry already has exact timestamp/speaker boundaries from the
+    manifest, so there's no risk of the translator merging/splitting lines and
+    desyncing them from timestamps (the failure mode the original scripts had
+    to guard against with a length-mismatch fallback)."""
+    from deep_translator import GoogleTranslator
+    translator = GoogleTranslator(source="auto", target=target_lang)
+    texts = [e["text"] for e in entries]
+
+    try:
+        translated = translator.translate_batch(texts)
+    except Exception as e:
+        print(f"[!] Batch translation failed ({e}), falling back to one-by-one...")
+        translated = []
+        for t in texts:
+            try:
+                translated.append(translator.translate(t))
+            except Exception as e2:
+                print(f"[!] Translation error on a line, leaving it untranslated: {e2}")
+                translated.append(t)
+
+    if len(translated) != len(texts):
+        print("[!] Translated output length didn't match input - leaving text untranslated for safety.")
+        translated = texts
+
+    out_entries = []
+    for e, t in zip(entries, translated):
+        e2 = dict(e)
+        e2["original_text"] = e["text"]
+        e2["text"] = t if t else e["text"]
+        out_entries.append(e2)
+    return out_entries
+
+
+def reassemble(manifest_path: str, transcripts_dirs: list, output_basename: str, offer_translation: bool = True):
+    entries, manifest, missing_count = build_entries(manifest_path, transcripts_dirs)
+    source_file = manifest.get("source_file")
+
+    # Transcript compiler: if SPLIT used SepFormer pre-diarization splice,
+    # all times are on the longer spliced timeline — map them back to original.
+    splice_manifest = manifest.get("splice_manifest")
+    if splice_manifest and splice_manifest.get("splices"):
+        print("[+] Remapping timestamps from spliced timeline → original audio timeline...")
+        try:
+            entries = remap_entries_to_original(entries, splice_manifest)
+            print(f"[OK] Remapped {len(entries)} entr(y/ies) to original timeline.")
+        except Exception as e:
+            print(f"[!] Timestamp remap failed ({e}). Writing spliced-timeline times as-is.")
+
+    write_outputs(entries, output_basename, source_file)
+    if missing_count:
+        print(f"[!] {missing_count} segment(s) had no matching transcript file - marked [MISSING TRANSCRIPT].")
+
+    if offer_translation:
+        target_lang = prompt_translation_choice()
+        if target_lang:
+            print(f"[+] Translating to '{target_lang}'...")
+            translated_entries = translate_entries(entries, target_lang)
+            write_outputs(translated_entries, f"{output_basename}_{target_lang}", source_file)
+
+
+def do_reassemble_mode(manifest_path: str = None):
+    manifest_path = manifest_path or resolve_manifest_choice()
+    if not os.path.exists(manifest_path):
+        print(f"[!] Manifest not found: {manifest_path}")
+        return
+
+    default_dirs = [DEFAULT_TRANSCRIPTS_DIR, os.path.dirname(manifest_path), os.getcwd()]
+    transcripts_dirs = default_dirs
+
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        manifest = json.load(f)
+    still_missing = [s for s in manifest["segments"] if find_transcript_file(s["file"], transcripts_dirs)[0] is None]
+
+    if still_missing:
+        print(f"\n[+] {len(still_missing)} segment(s) don't have a transcript yet.")
+        auto = input("Auto-transcribe them now before reassembling? (Y/n): ").strip().lower() != "n"
+        if auto:
+            backend, style, fixed_language, workers = prompt_backend_choice()
+            auto_transcribe_missing(
+                manifest_path, transcripts_dirs, backend, style,
+                fixed_language=fixed_language, parallel_workers=workers,
+            )
+
+    out_dir = os.path.dirname(manifest_path)
+    default_output = os.path.join(out_dir, "final_transcript")
+    raw = input(f"Output basename (default: {default_output}): ").strip()
+    output_basename = raw or default_output
+
+    reassemble(manifest_path, transcripts_dirs, output_basename)
+    # Models may have been loaded by the auto-transcribe path above
+    unload_transcribe_models()
+    unload_langid_model()
+    free_memory(aggressive=True)
+
+
+# =========================================================================
+# CLEANUP
+# =========================================================================
+def cleanup_local_audio(aggressive: bool = False, manifest_paths: list = None):
+    """Remove bulk audio that is no longer needed.
+    - Always: purge TEMP_SLICES_DIR and any leftover temporary files.
+    - Light (default): also remove DOWNLOAD_DIR contents and NORMALIZED_DIR.
+    - Aggressive: additionally remove any leftover per-turn WAVs under the
+      given manifest directories (or the whole SEGMENTS_ROOT tree of WAVs),
+      leaving only manifest.json + text transcripts on Drive.
+
+    Never deletes transcripts, final outputs, tokens, or keys.
+    """
+    import glob as _glob
+
+    removed_bytes = 0
+    removed_files = 0
+
+    def _rm(path):
+        nonlocal removed_bytes, removed_files
+        try:
+            if os.path.isfile(path):
+                removed_bytes += os.path.getsize(path)
+                os.remove(path)
+                removed_files += 1
+            elif os.path.isdir(path):
+                shutil.rmtree(path, ignore_errors=True)
+        except OSError:
+            pass
+
+    # 1. Always clear short-lived slices
+    if os.path.isdir(TEMP_SLICES_DIR):
+        for f in _glob.glob(os.path.join(TEMP_SLICES_DIR, "*")):
+            _rm(f)
+
+    if not aggressive:
+        for d in (DOWNLOAD_DIR, NORMALIZED_DIR):
+            if os.path.isdir(d):
+                for f in _glob.glob(os.path.join(d, "*")):
+                    _rm(f)
+        print(f"[+] Light cleanup: removed {removed_files} local audio file(s) "
+              f"({removed_bytes / 1_000_000:.1f} MB). Manifests + transcripts kept.")
+        return
+
+    # Aggressive: also drop any permanent per-turn WAVs that may exist
+    targets = []
+    if manifest_paths:
+        for mp in manifest_paths:
+            d = os.path.dirname(mp)
+            targets.extend(_glob.glob(os.path.join(d, "seg_*.wav")))
+    else:
+        targets = _glob.glob(os.path.join(SEGMENTS_ROOT, "*", "seg_*.wav"))
+
+    for f in targets:
+        _rm(f)
+
+    for d in (DOWNLOAD_DIR, NORMALIZED_DIR):
+        if os.path.isdir(d):
+            for f in _glob.glob(os.path.join(d, "*")):
+                _rm(f)
+
+    print(f"[+] Aggressive cleanup: removed {removed_files} audio file(s) "
+          f"({removed_bytes / 1_000_000:.1f} MB). Only manifests + text transcripts remain.")
+
+
+def prompt_and_cleanup(manifest_paths: list = None):
+    """Ask the user whether (and how aggressively) to clean up local audio."""
+    print("\n[+] Cleanup options (frees Colab / local disk and avoids filling Drive):")
+    print("  1. Light   – delete downloads, normalized full audio, and temp slices")
+    print("  2. Aggressive – also delete any leftover per-turn WAVs (keeps only manifests + transcripts)")
+    print("  3. Skip")
+    raw = input("Choose 1-3 (default 1): ").strip()
+    if raw == "3":
+        print("[+] Skipping cleanup.")
+        return
+    aggressive = raw == "2"
+    cleanup_local_audio(aggressive=aggressive, manifest_paths=manifest_paths)
+
+
+# =========================================================================
+# FULL RUN MODE
+# =========================================================================
+def do_full_run():
+    manifest_paths = do_split_mode(prompt_for_settings=True)
+    if not manifest_paths:
+        print("[!] Split produced nothing to transcribe. Stopping.")
+        return
+
+    # Explicit free after split – diarization pipeline + langid already unloaded
+    # inside split_file / run_diarization, but make sure nothing lingers
+    free_memory(aggressive=True)
+
+    backend, style, fixed_language, workers = prompt_backend_choice()
+    target_lang = prompt_translation_choice()
+
+    for mp in manifest_paths:
+        transcripts_dirs = [DEFAULT_TRANSCRIPTS_DIR, os.path.dirname(mp), os.getcwd()]
+        auto_transcribe_missing(
+            mp, transcripts_dirs, backend, style,
+            fixed_language=fixed_language, parallel_workers=workers,
+        )
+        out_dir = os.path.dirname(mp)
+        output_basename = os.path.join(out_dir, "final_transcript")
+
+        entries, manifest, missing_count = build_entries(mp, transcripts_dirs)
+        splice_manifest = manifest.get("splice_manifest")
+        if splice_manifest and splice_manifest.get("splices"):
+            print("[+] Remapping timestamps from spliced timeline → original audio timeline...")
+            try:
+                entries = remap_entries_to_original(entries, splice_manifest)
+                print(f"[OK] Remapped {len(entries)} entr(y/ies) to original timeline.")
+            except Exception as e:
+                print(f"[!] Timestamp remap failed ({e}). Writing spliced-timeline times as-is.")
+        write_outputs(entries, output_basename, manifest.get("source_file"))
+        if missing_count:
+            print(f"[!] {missing_count} segment(s) had no matching transcript file - marked [MISSING TRANSCRIPT].")
+        if target_lang:
+            print(f"[+] Translating to '{target_lang}'...")
+            translated_entries = translate_entries(entries, target_lang)
+            write_outputs(translated_entries, f"{output_basename}_{target_lang}", manifest.get("source_file"))
+
+    # Final model teardown + cleanup
+    unload_transcribe_models()
+    unload_langid_model()
+    free_memory(aggressive=True)
+    prompt_and_cleanup(manifest_paths)
+
+
+# =========================================================================
+# MAIN
+# =========================================================================
+def main():
+    print("Which step do you want to run?")
+    print("  1. SPLIT       - diarize (writes lightweight timestamp manifest only)")
+    print("  2. TRANSCRIBE  - auto-transcribe missing segments (reconstructs audio on demand)")
+    print("  3. REASSEMBLE  - stitch transcribed segments into one transcript (auto-fills gaps)")
+    print("  4. FULL RUN    - split -> transcribe -> reassemble + cleanup")
+    choice = input("Choose 1-4: ").strip()
+
+    if choice == "1":
+        do_split_mode()
+    elif choice == "2":
+        do_transcribe_mode()
+    elif choice == "3":
+        do_reassemble_mode()
+        prompt_and_cleanup()
+    elif choice == "4":
+        do_full_run()
+    else:
+        print("[!] Please enter a number 1-4.")
+
+
+if __name__ == "__main__":
+    main()
