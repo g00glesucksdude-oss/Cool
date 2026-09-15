@@ -1443,50 +1443,112 @@ def _load_wav_mono_float32(path: str, target_sr: int = 16000):
 
 def detect_overlap_regions_osd(audio_path: str, hf_token: str, min_duration_on: float = 0.3,
                                min_duration_off: float = 0.1) -> list:
-    """Run pyannote OverlappedSpeechDetection (no speaker IDs).
-    Returns list of {"start": float, "end": float}."""
+    """Run overlapped-speech detection. Returns list of {"start": float, "end": float}.
+
+    Compatible with pyannote.audio 3.x and 4.x (OverlappedSpeechDetection was
+    removed in 4.0). Tries three strategies in order:
+      1. Official HF pipeline  pyannote/overlapped-speech-detection
+      2. OverlappedSpeechDetection class (still present on 3.x)
+      3. Inference on pyannote/segmentation-3.0 + second-max activation
+    """
     import torch
-    from pyannote.audio import Model
+    from pyannote.audio import Model, Pipeline, Inference
+    from pyannote.audio.utils.signal import Binarize
+
+    print("[+] Loading overlapped-speech detection...")
+
+    # ---------- 1. Preferred: official HF pipeline ----------
+    try:
+        try:
+            pipeline = Pipeline.from_pretrained(
+                "pyannote/overlapped-speech-detection",
+                token=hf_token
+            )
+        except TypeError:
+            pipeline = Pipeline.from_pretrained(
+                "pyannote/overlapped-speech-detection",
+                use_auth_token=hf_token
+            )
+        if torch.cuda.is_available():
+            pipeline.to(torch.device("cuda"))
+
+        annotation = pipeline(audio_path)
+        regions = []
+        for segment in annotation.get_timeline().support():
+            if segment.duration >= min_duration_on:
+                regions.append({"start": float(segment.start), "end": float(segment.end)})
+        regions.sort(key=lambda r: r["start"])
+        print(f"[+] OSD (HF pipeline) found {len(regions)} overlap region(s).")
+        del pipeline
+        free_memory(aggressive=True)
+        return regions
+    except Exception as e:
+        print(f"[~] Dedicated OSD pipeline failed ({e}). Trying alternatives...")
+
+    # ---------- 2. Try the class if it still exists (pyannote 3.x) ----------
     try:
         from pyannote.audio.pipelines import OverlappedSpeechDetection
-    except ImportError:
-        raise RuntimeError(
-            "OverlappedSpeechDetection not available in this pyannote.audio version. "
-            "Upgrade pyannote.audio or skip overlap resolution."
-        )
-
-    print("[+] Loading overlapped-speech detection (pyannote/segmentation-3.0)...")
-    try:
         try:
             seg_model = Model.from_pretrained("pyannote/segmentation-3.0", token=hf_token)
         except TypeError:
             seg_model = Model.from_pretrained("pyannote/segmentation-3.0", use_auth_token=hf_token)
-    except Exception as e:
-        raise RuntimeError(
-            f"Could not load pyannote/segmentation-3.0 ({e}). "
-            "Accept access at https://huggingface.co/pyannote/segmentation-3.0"
-        ) from e
 
-    osd = OverlappedSpeechDetection(segmentation=seg_model)
-    osd.instantiate({
-        "min_duration_on": min_duration_on,
-        "min_duration_off": min_duration_off,
-    })
-    if torch.cuda.is_available():
-        osd.to(torch.device("cuda"))
+        osd = OverlappedSpeechDetection(segmentation=seg_model)
+        osd.instantiate({
+            "min_duration_on": min_duration_on,
+            "min_duration_off": min_duration_off,
+        })
+        if torch.cuda.is_available():
+            osd.to(torch.device("cuda"))
 
-    try:
         annotation = osd(audio_path)
         regions = []
         timeline = annotation.get_timeline().support() if hasattr(annotation, "get_timeline") else annotation
         for segment in timeline:
             regions.append({"start": float(segment.start), "end": float(segment.end)})
         regions.sort(key=lambda r: r["start"])
-        print(f"[+] OSD found {len(regions)} overlap region(s).")
-        return regions
-    finally:
+        print(f"[+] OSD (OverlappedSpeechDetection class) found {len(regions)} overlap region(s).")
         del osd, seg_model
         free_memory(aggressive=True)
+        return regions
+    except Exception as e:
+        print(f"[~] OverlappedSpeechDetection class failed ({e}). Falling back to Inference...")
+
+    # ---------- 3. Modern fallback: Inference on segmentation-3.0 + second max ----------
+    try:
+        try:
+            model = Model.from_pretrained("pyannote/segmentation-3.0", token=hf_token)
+        except TypeError:
+            model = Model.from_pretrained("pyannote/segmentation-3.0", use_auth_token=hf_token)
+
+        # second highest activation → overlapped speech score
+        def to_osd(output):
+            import numpy as np
+            return np.partition(output, -2, axis=-1)[..., -2, np.newaxis]
+
+        inference = Inference(model, pre_aggregation_hook=to_osd, duration=5.0, step=0.5)
+        if torch.cuda.is_available():
+            inference.to(torch.device("cuda"))
+
+        scores = inference(audio_path)
+        binarize = Binarize(
+            onset=0.5, offset=0.5,
+            min_duration_on=min_duration_on,
+            min_duration_off=min_duration_off,
+        )
+        annotation = binarize(scores)
+        regions = []
+        for segment in annotation.get_timeline().support():
+            regions.append({"start": float(segment.start), "end": float(segment.end)})
+        regions.sort(key=lambda r: r["start"])
+        print(f"[+] OSD (Inference + 2nd-max) found {len(regions)} overlap region(s).")
+        del inference, model
+        free_memory(aggressive=True)
+        return regions
+    except Exception as e:
+        print(f"[!] All OSD methods failed ({e}). Returning empty list.")
+        free_memory(aggressive=True)
+        return []
 
 
 def resolve_overlaps_before_diarization(clean_path: str, hf_token: str) -> tuple:
