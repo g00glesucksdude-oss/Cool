@@ -10,7 +10,16 @@ from groq import Groq
 # --- CONFIG ---
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 KEYS_FILE = os.path.join(SCRIPT_DIR, "turbo_transcribe_keys.json")
+USAGE_FILE = os.path.join(SCRIPT_DIR, "turbo_transcribe_usage.json")
 MODEL = "whisper-large-v3-turbo"
+
+# --- PAID KEY / SPENDING LIMIT CONFIG ---
+# Groq's published rate for whisper-large-v3-turbo (USD per minute of audio).
+# Edit this if Groq's pricing changes.
+COST_PER_MINUTE_USD = 0.000667   # confirmed: Groq bills whisper-large-v3-turbo at $0.04/hour
+FALLBACK_USD_TO_PHP = 62.8       # used only if the live rate can't be fetched
+FX_RATE_FILE = os.path.join(SCRIPT_DIR, "usd_php_rate_cache.json")
+FX_CACHE_MAX_AGE_SEC = 24 * 60 * 60  # refetch at most once a day
 
 TARGET_CHUNK_SEC = 15 * 60          # aim for ~15 min chunks
 SEARCH_WINDOW_SEC = 30              # look +/- 30s around target for a quiet spot to cut
@@ -40,15 +49,129 @@ def save_keys(keys: list):
 def add_key_prompt(keys: list) -> list:
     label = input("Label for this key (e.g. 'personal', 'work'): ").strip() or f"key{len(keys) + 1}"
     key = input("Paste your Groq API key: ").strip()
-    keys.append({"label": label, "key": key})
+
+    paid = input("Is this a paid key (no free-tier rate limits to rotate away from)? [y/N]: ").strip().lower() == "y"
+
+    daily_limit_php = None
+    if paid:
+        raw_limit = input(
+            "Daily spending cap for this key in PHP (e.g. 24), or leave blank for no cap: "
+        ).strip()
+        if raw_limit:
+            try:
+                daily_limit_php = float(raw_limit)
+            except ValueError:
+                print("[!] Couldn't parse that number, leaving cap unset.")
+
+    keys.append({
+        "label": label,
+        "key": key,
+        "paid": paid,
+        "daily_limit_php": daily_limit_php,
+    })
     save_keys(keys)
-    print(f"[+] Saved '{label}'.")
+    print(f"[+] Saved '{label}'" + (f" (paid, cap ₱{daily_limit_php}/day)" if paid and daily_limit_php else " (paid, no cap)" if paid else ""))
     return keys
 
 
+# --- USAGE / SPEND TRACKING ---
+def _today_str() -> str:
+    return time.strftime("%Y-%m-%d")
+
+
+def load_usage() -> dict:
+    if not os.path.exists(USAGE_FILE):
+        return {}
+    try:
+        with open(USAGE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_usage(usage: dict):
+    with open(USAGE_FILE, "w", encoding="utf-8") as f:
+        json.dump(usage, f, indent=2)
+
+
+def get_spent_today_php(label: str) -> float:
+    usage = load_usage()
+    day = usage.get(_today_str(), {})
+    return day.get(label, 0.0)
+
+
+def add_spend_php(label: str, amount_php: float):
+    usage = load_usage()
+    today = _today_str()
+    usage.setdefault(today, {})
+    usage[today][label] = usage[today].get(label, 0.0) + amount_php
+    save_usage(usage)
+
+
+def _fetch_live_usd_to_php() -> float:
+    """Hit a free, no-key FX API. Raises on any failure (network, bad JSON, etc)."""
+    import urllib.request
+    url = "https://open.er-api.com/v6/latest/USD"
+    with urllib.request.urlopen(url, timeout=5) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    rate = data["rates"]["PHP"]
+    return float(rate)
+
+
+def get_usd_to_php() -> float:
+    """Returns a cached rate if it's fresh (< FX_CACHE_MAX_AGE_SEC old), else tries to
+    fetch a live one and re-cache it. Falls back to FALLBACK_USD_TO_PHP if offline."""
+    cached = None
+    if os.path.exists(FX_RATE_FILE):
+        try:
+            with open(FX_RATE_FILE, "r", encoding="utf-8") as f:
+                cached = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            cached = None
+
+    if cached and (time.time() - cached.get("fetched_at", 0)) < FX_CACHE_MAX_AGE_SEC:
+        return cached["rate"]
+
+    try:
+        rate = _fetch_live_usd_to_php()
+        with open(FX_RATE_FILE, "w", encoding="utf-8") as f:
+            json.dump({"rate": rate, "fetched_at": time.time()}, f, indent=2)
+        print(f"[+] Fetched live USD->PHP rate: {rate:.3f}")
+        return rate
+    except Exception as e:
+        if cached:
+            print(f"[!] Couldn't refresh FX rate ({e}); using last cached rate {cached['rate']:.3f}.")
+            return cached["rate"]
+        print(f"[!] Couldn't fetch live FX rate ({e}); using fallback {FALLBACK_USD_TO_PHP}.")
+        return FALLBACK_USD_TO_PHP
+
+
+def estimate_cost_php(duration_sec: float) -> float:
+    minutes = duration_sec / 60.0
+    return minutes * COST_PER_MINUTE_USD * get_usd_to_php()
+
+
+def key_over_daily_limit(key_info: dict) -> bool:
+    cap = key_info.get("daily_limit_php")
+    if not cap:
+        return False
+    return get_spent_today_php(key_info["label"]) >= cap
+
+
 def select_api_keys() -> list:
-    """Returns an ordered list of API key strings to rotate through when one gets rate-limited."""
+    """Returns an ordered list of key_info dicts to rotate through when one gets rate-limited.
+    Each dict has: label, key, paid, daily_limit_php."""
     keys = load_keys()
+
+    # migrate old-format keys (no 'paid' field) so nothing breaks
+    changed = False
+    for k in keys:
+        if "paid" not in k:
+            k["paid"] = False
+            k["daily_limit_php"] = None
+            changed = True
+    if changed:
+        save_keys(keys)
 
     if not keys:
         print("[+] No saved Groq API keys found. Let's add one.")
@@ -57,16 +180,31 @@ def select_api_keys() -> list:
     while True:
         print("\nSaved API keys:")
         for i, k in enumerate(keys, 1):
-            print(f"  {i}. {k['label']}")
+            tag = ""
+            if k.get("paid"):
+                cap = k.get("daily_limit_php")
+                spent = get_spent_today_php(k["label"])
+                if cap:
+                    tag = f"  [paid, ₱{spent:.2f}/₱{cap:.2f} spent today]"
+                else:
+                    tag = "  [paid, no cap]"
+            print(f"  {i}. {k['label']}{tag}")
         print(f"  {len(keys) + 1}. Add a new key")
 
         raw = input(
-            f"Select key(s) to use this session (e.g. '1' or '1,3' or 'all'), "
+            f"Select key(s) to use this session (e.g. '1' or '1,3' or 'all' or 'paid'), "
             f"or {len(keys) + 1} to add one: "
         ).strip().lower()
 
         if raw == "all":
-            return [k["key"] for k in keys]
+            return keys
+
+        if raw == "paid":
+            paid_keys = [k for k in keys if k.get("paid")]
+            if paid_keys:
+                return paid_keys
+            print("[!] No paid keys saved yet.")
+            continue
 
         if raw == str(len(keys) + 1):
             keys = add_key_prompt(keys)
@@ -74,7 +212,7 @@ def select_api_keys() -> list:
 
         try:
             indices = [int(x.strip()) for x in raw.split(",") if x.strip()]
-            selected = [keys[i - 1]["key"] for i in indices if 1 <= i <= len(keys)]
+            selected = [keys[i - 1] for i in indices if 1 <= i <= len(keys)]
             if selected:
                 return selected
         except ValueError:
@@ -254,12 +392,25 @@ def is_quota_or_rate_limit_error(e: Exception) -> bool:
 
 # --- TRANSCRIPTION ---
 def transcribe_file(api_keys: list, file_path: str):
+    """api_keys: list of key_info dicts (label, key, paid, daily_limit_php)."""
     if not os.path.exists(file_path):
         print(f"[!] Error: Could not find the file '{file_path}'")
         return
 
-    key_index = 0
-    client = Groq(api_key=api_keys[key_index])
+    def next_usable_key_index(start_index: int) -> int:
+        """Skip over keys that have already hit their daily peso cap."""
+        idx = start_index
+        while idx < len(api_keys) and key_over_daily_limit(api_keys[idx]):
+            k = api_keys[idx]
+            print(f"[!] Key '{k['label']}' already hit its ₱{k['daily_limit_php']:.2f}/day cap. Skipping.")
+            idx += 1
+        return idx
+
+    key_index = next_usable_key_index(0)
+    if key_index >= len(api_keys):
+        print("\n[STOPPED] Every selected key has already hit its daily spending cap.")
+        return
+    client = Groq(api_key=api_keys[key_index]["key"])
 
     print(f"\n[+] Probing '{os.path.basename(file_path)}' (no full load)...")
     duration = get_duration(file_path)
@@ -295,9 +446,28 @@ def transcribe_file(api_keys: list, file_path: str):
         size_mb = os.path.getsize(chunk_name) / (1024 * 1024)
 
         while True:
+            key_info = api_keys[key_index]
+
+            # re-check cap right before spending (in case a prior chunk pushed it over)
+            if key_over_daily_limit(key_info):
+                print(f"[!] Key '{key_info['label']}' hit its ₱{key_info['daily_limit_php']:.2f}/day cap.")
+                key_index = next_usable_key_index(key_index + 1)
+                if key_index >= len(api_keys):
+                    if os.path.exists(chunk_name):
+                        os.remove(chunk_name)
+                    print(
+                        "\n[STOPPED] All available keys have hit their daily spending caps.\n"
+                        f"Progress is saved — {sum(1 for t in texts if t is not None)}/{len(chunks)} "
+                        "chunks done. Rerun tomorrow (or raise the cap) to continue.\n"
+                    )
+                    return
+                client = Groq(api_key=api_keys[key_index]["key"])
+                continue
+
             print(f"[>] Chunk {i+1}/{len(chunks)} ({size_mb:.1f} MB, "
                   f"{start_sec/60:.1f}-{end_sec/60:.1f} min) -> Groq "
-                  f"({MODEL}, key '{key_index+1}/{len(api_keys)}')...")
+                  f"({MODEL}, key '{key_info['label']}' {key_index+1}/{len(api_keys)}"
+                  f"{', paid' if key_info.get('paid') else ''})...")
             try:
                 with open(chunk_name, "rb") as audio_file:
                     response = client.audio.transcriptions.create(
@@ -310,28 +480,36 @@ def transcribe_file(api_keys: list, file_path: str):
                 texts[i] = text
                 running_context = (running_context + " " + text).strip()
                 save_progress(file_path, chunks, texts, running_context)
+
+                cost_php = estimate_cost_php(end_sec - start_sec)
+                add_spend_php(key_info["label"], cost_php)
+                if key_info.get("paid"):
+                    spent = get_spent_today_php(key_info["label"])
+                    cap = key_info.get("daily_limit_php")
+                    cap_str = f"/₱{cap:.2f}" if cap else ""
+                    print(f"    (~₱{cost_php:.3f} this chunk, ₱{spent:.2f}{cap_str} spent today on '{key_info['label']}')")
                 break
 
             except Exception as e:
                 if is_quota_or_rate_limit_error(e):
-                    print(f"[!] Key '{key_index+1}' hit a rate limit/quota error: {e}")
+                    print(f"[!] Key '{key_info['label']}' hit a rate limit/quota error: {e}")
                     print(f"[+] Waiting {RATE_LIMIT_COOLDOWN_SEC}s before retrying...")
                     time.sleep(RATE_LIMIT_COOLDOWN_SEC)
 
-                    key_index += 1
+                    key_index = next_usable_key_index(key_index + 1)
                     if key_index >= len(api_keys):
                         if os.path.exists(chunk_name):
                             os.remove(chunk_name)
                         print(
                             "\n[STOPPED] All available API keys are exhausted for now.\n"
-                            f"Progress is saved â€” {sum(1 for t in texts if t is not None)}/{len(chunks)} "
+                            f"Progress is saved — {sum(1 for t in texts if t is not None)}/{len(chunks)} "
                             "chunks done.\n"
                             "Just rerun the script later (or add another key) and it will "
                             "pick up exactly where it left off.\n"
                         )
                         return
-                    print(f"[+] Switching to key {key_index+1}/{len(api_keys)}...")
-                    client = Groq(api_key=api_keys[key_index])
+                    print(f"[+] Switching to key '{api_keys[key_index]['label']}' ({key_index+1}/{len(api_keys)})...")
+                    client = Groq(api_key=api_keys[key_index]["key"])
                     continue
                 else:
                     print(f"[!] Error during chunk {i+1}: {e}")
