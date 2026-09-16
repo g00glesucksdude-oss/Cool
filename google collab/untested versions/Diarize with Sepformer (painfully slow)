@@ -2333,4 +2333,722 @@ def load_local_resume_state() -> dict:
 
 
 def save_local_resume_state(state: dict):
-    with open 
+    with open(LOCAL_RESUME_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2)
+
+
+def transcribe_segment_local(model, seg_path: str, out_path: str, initial_prompt: str,
+                             fixed_language: str = None):
+    """Writes '[start -> end] text' lines to out_path progressively (flush +
+    fsync per line), and tracks a resume state on Drive keyed by the stable
+    transcript path (out_path) so mid-segment resume still works when audio
+    is reconstructed from different temp slice paths each run.
+
+    If a prior run was interrupted mid-segment, seeks past the completed
+    portion via ffmpeg (exact re-encode seek, same technique as the original
+    Colab script - not '-c copy', which snaps to the nearest keyframe) and
+    continues appending rather than restarting the whole segment. Returns the
+    full segment text and the last detected language.
+
+    fixed_language: ISO code (e.g. 'en') forces that language — no per-segment
+    redetect / switch. None = auto-detect.
+    """
+    state = load_local_resume_state()
+    # Prefer stable transcript-path key; fall back to legacy audio-path key
+    entry = state.get(out_path) or state.get(seg_path) or {"last_end": 0.0, "done": False}
+
+    if entry.get("done") and os.path.exists(out_path):
+        with open(out_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        lines = [m.group(3) for m in COLAB_LINE_RE.finditer(content)] if content else []
+        return " ".join(lines).strip(), fixed_language
+
+    resume_offset = float(entry.get("last_end", 0.0))
+    process_path = seg_path
+    if resume_offset > 0:
+        resume_tmp = seg_path + ".resume.wav"
+        try:
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", seg_path, "-ss", str(resume_offset), resume_tmp],
+                check=True, capture_output=True,
+            )
+            process_path = resume_tmp
+            print(f"    [+] Resuming this segment from {resume_offset:.2f}s (previous run was interrupted).")
+        except Exception as e:
+            print(f"    [!] Couldn't seek to resume point ({e}) - restarting this segment from scratch.")
+            resume_offset = 0.0
+            process_path = seg_path
+
+    mode = "a" if resume_offset > 0 else "w"
+    segments, info = model.transcribe(
+        process_path,
+        beam_size=1,
+        language=fixed_language,  # None = auto; set = stick to one language
+        vad_filter=True,          # skip pure silence → faster
+        condition_on_previous_text=False,
+        initial_prompt=initial_prompt[-CONTEXT_CHARS:] if initial_prompt else None,
+    )
+
+    all_text = []
+    with open(out_path, mode, encoding="utf-8") as f_out:
+        for seg in segments:
+            start, end = seg.start + resume_offset, seg.end + resume_offset
+            text = seg.text.strip()
+            all_text.append(text)
+            f_out.write(f"[{start:.2f}s -> {end:.2f}s] {text}\n")
+            f_out.flush()
+            os.fsync(f_out.fileno())
+
+            entry["last_end"] = end
+            # Always write under the stable transcript path
+            state[out_path] = entry
+            # Drop any legacy audio-path key so state stays clean
+            if seg_path in state and seg_path != out_path:
+                state.pop(seg_path, None)
+            save_local_resume_state(state)
+
+    entry["done"] = True
+    state[out_path] = entry
+    if seg_path in state and seg_path != out_path:
+        state.pop(seg_path, None)
+    save_local_resume_state(state)
+
+    if process_path != seg_path and os.path.exists(process_path):
+        os.remove(process_path)
+
+    # if we resumed, all_text only has the NEW portion - read the full file back for context purposes
+    if resume_offset > 0:
+        with open(out_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        all_text = [m.group(3) for m in COLAB_LINE_RE.finditer(content)]
+
+    lang = fixed_language or getattr(info, "language", None)
+    return " ".join(all_text).strip(), lang
+
+
+def seed_initial_context(manifest_path: str, transcripts_dirs: list, first_missing_index: int) -> str:
+    """Builds trailing context from whatever segments before the first missing
+    one already have a transcript, so continuity isn't lost just because some
+    segments were done in a prior run or hand-dropped in."""
+    entries, _, _ = build_entries(manifest_path, transcripts_dirs)
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        manifest = json.load(f)
+    cutoff_start = manifest["segments"][first_missing_index]["start_sec"] if first_missing_index < len(manifest["segments"]) else None
+    prior_text = " ".join(e["text"] for e in entries if cutoff_start is None or e["start"] < cutoff_start)
+    return prior_text[-CONTEXT_CHARS:] if prior_text else ""
+
+
+def auto_transcribe_missing(manifest_path: str, transcripts_dirs: list, backend: str, style: str,
+                            fixed_language: str = None, parallel_workers: int = 1) -> int:
+    """Transcribes any segment in the manifest that doesn't already have a
+    transcript file in transcripts_dirs.
+
+    fixed_language: ISO code (e.g. 'en') locks language for the whole run —
+      no switch detection, context never dropped for language reasons.
+    parallel_workers: >1 enables concurrent Groq API calls (big speedup).
+      Local GPU stays sequential (one model); slices are still prefetched.
+
+    Returns count newly transcribed.
+    """
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        manifest = json.load(f)
+
+    seg_dir = os.path.dirname(manifest_path)
+    all_segments = manifest["segments"]
+
+    if backend == "groq":
+        n_cleaned = cleanup_incomplete_local_transcripts(manifest, transcripts_dirs)
+        if n_cleaned:
+            print(f"[+] Cleaned {n_cleaned} incomplete local transcript(s) so Groq can redo them.")
+
+    missing_indices = [
+        i for i, seg in enumerate(all_segments)
+        if find_transcript_file(seg["file"], transcripts_dirs)[0] is None
+    ]
+
+    if not missing_indices:
+        print("[+] Every segment already has a transcript.")
+        return 0
+
+    workers = max(1, int(parallel_workers or 1))
+    # Local Whisper on one GPU cannot usefully parallelize inference
+    if backend == "local" and workers > 1:
+        print("[~] Local GPU transcription stays sequential (one model). "
+              "Parallel workers apply to Groq / slice prefetch only.")
+        workers = 1
+
+    lang_note = f", language={fixed_language}" if fixed_language else ", language=auto"
+    print(f"[+] {len(missing_indices)} segment(s) need transcribing "
+          f"(backend: {backend}, style: {style}{lang_note}, workers: {workers}).")
+
+    unload_langid_model()
+    free_memory(aggressive=True)
+
+    client_holder = None
+    api_keys = []
+    local_model = None
+    model_id = None
+    api_lock = threading.Lock()
+
+    try:
+        if backend == "groq":
+            api_keys = select_groq_keys()
+            from groq import Groq
+            client_holder = {"client": Groq(api_key=api_keys[0]), "key_index": 0}
+            model_id = GROQ_MODEL_IDS[style]
+        else:
+            local_model = get_transcribe_model(style)
+
+        seed_ctx = seed_initial_context(manifest_path, transcripts_dirs, missing_indices[0])
+        stick_lang = bool(fixed_language)
+
+        # ---------- PARALLEL GROQ PATH ----------
+        if backend == "groq" and workers > 1:
+            print(f"[+] Parallel Groq mode ({workers} workers). "
+                  "Cross-segment context uses seed only (speed > sequential continuity).")
+
+            def _work(n_idx_pair):
+                n, idx = n_idx_pair
+                seg = all_segments[idx]
+                stem = os.path.splitext(seg["file"])[0]
+                seg_path, is_temp = get_segment_audio_path(manifest, seg, seg_dir)
+                try:
+                    print(f"  [{n}/{len(missing_indices)}] Transcribing {seg['file']} "
+                          f"({seg['start_sec']:.2f}s-{seg['end_sec']:.2f}s) (groq/{style})...")
+                    text, lang = transcribe_segment_groq(
+                        client_holder, api_keys, seg_path, model_id, seed_ctx,
+                        fixed_language=fixed_language, lock=api_lock,
+                    )
+                    out_path = os.path.join(DEFAULT_TRANSCRIPTS_DIR, f"{stem}_transcript.txt")
+                    with open(out_path, "w", encoding="utf-8") as f:
+                        f.write(text)
+                    return idx, text, lang or fixed_language, None
+                except Exception as e:
+                    return idx, None, None, e
+                finally:
+                    if is_temp and seg_path and os.path.exists(seg_path):
+                        try:
+                            os.remove(seg_path)
+                        except OSError:
+                            pass
+
+            done_count = 0
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futs = {
+                    pool.submit(_work, (n, idx)): idx
+                    for n, idx in enumerate(missing_indices, 1)
+                }
+                for fut in as_completed(futs):
+                    idx, text, lang, err = fut.result()
+                    if err is not None:
+                        print(f"[!] Failed on segment index {idx}: {err}")
+                        continue
+                    if lang:
+                        all_segments[idx]["language"] = lang
+                    done_count += 1
+
+            with open(manifest_path, "w", encoding="utf-8") as f:
+                json.dump(manifest, f, indent=2)
+            return done_count
+
+        # ---------- SEQUENTIAL PATH (local, or Groq workers=1) ----------
+        running_context = seed_ctx
+        last_lang = fixed_language
+        done_count = 0
+
+        for n, idx in enumerate(missing_indices, 1):
+            seg = all_segments[idx]
+            stem = os.path.splitext(seg["file"])[0]
+            print(f"  [{n}/{len(missing_indices)}] Transcribing {seg['file']} "
+                  f"({seg['start_sec']:.2f}s-{seg['end_sec']:.2f}s) ({backend}/{style})...")
+
+            seg_path = None
+            is_temp = False
+            try:
+                seg_path, is_temp = get_segment_audio_path(manifest, seg, seg_dir)
+
+                if backend == "groq":
+                    text, lang = transcribe_segment_groq(
+                        client_holder, api_keys, seg_path, model_id, running_context,
+                        fixed_language=fixed_language, lock=None,
+                    )
+                    out_path = os.path.join(DEFAULT_TRANSCRIPTS_DIR, f"{stem}_transcript.txt")
+                    with open(out_path, "w", encoding="utf-8") as f:
+                        f.write(text)
+                else:
+                    out_path = os.path.join(DEFAULT_TRANSCRIPTS_DIR, f"{stem}.txt")
+                    text, lang = transcribe_segment_local(
+                        local_model, seg_path, out_path, running_context,
+                        fixed_language=fixed_language,
+                    )
+
+                # Language-switch context drop — skipped when language is pinned
+                if (not stick_lang) and lang and last_lang and lang != last_lang:
+                    print(f"    [~] Language switch detected: '{last_lang}' -> '{lang}' "
+                          f"(dropping context for continuity)")
+                    running_context = ""
+                else:
+                    running_context = (running_context + " " + text).strip()
+                if lang:
+                    last_lang = lang
+                    seg["language"] = lang
+
+                done_count += 1
+
+            except Exception as e:
+                print(f"[!] Failed to transcribe {seg['file']}: {e}")
+                print("    Progress so far is saved — rerun to continue.")
+                break
+            finally:
+                if is_temp and seg_path and os.path.exists(seg_path):
+                    try:
+                        os.remove(seg_path)
+                    except OSError:
+                        pass
+                # Light GC only every 15 segments — prioritise speed over peak-RAM shaving
+                if n % 15 == 0:
+                    free_memory()
+
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            json.dump(manifest, f, indent=2)
+
+        return done_count
+    finally:
+        if backend == "local":
+            unload_transcribe_models()
+        free_memory(aggressive=True)
+
+
+def prompt_backend_choice() -> tuple:
+    """Returns (backend, style, fixed_language|None, parallel_workers)."""
+    print("\nWhich transcription backend?")
+    print("  1. Groq API (needs API key(s), rate-limited) — best with parallel workers")
+    print("  2. Local/Colab faster-whisper (uses GPU if available, no API key)")
+    raw = input("Choose 1 or 2 (default 1): ").strip()
+    backend = "local" if raw == "2" else "groq"
+
+    print("\nWhich model style?")
+    print("  1. turbo    - faster")
+    print("  2. large-v3 - slower, max accuracy")
+    raw2 = input("Choose 1 or 2 (default 1): ").strip()
+    style = "large" if raw2 == "2" else "turbo"
+
+    print("\nLanguage mode:")
+    print("  - Press Enter for AUTO (detect per segment; may drop context on language switches)")
+    print("  - Or type a code to LOCK one language for the whole run (e.g. en, es, ja, zh, pt)")
+    lang_raw = input("Language (default auto): ").strip().lower()
+    fixed_language = lang_raw if lang_raw else None
+    if fixed_language:
+        print(f"[+] Locked language: {fixed_language} (no switch detection)")
+
+    workers = 1
+    if backend == "groq":
+        raw_w = input(
+            "Parallel Groq workers? (1 = sequential with full context, "
+            "4–8 = much faster, default 4): "
+        ).strip()
+        try:
+            workers = int(raw_w) if raw_w else 4
+        except ValueError:
+            workers = 4
+        workers = max(1, min(workers, 16))
+    else:
+        print("[+] Local mode: sequential GPU inference (fastest for a single model).")
+
+    return backend, style, fixed_language, workers
+
+
+def resolve_manifest_choice() -> str:
+    manifests = sorted(glob.glob(os.path.join(SEGMENTS_ROOT, "*", "manifest.json")))
+    if manifests:
+        print("\n[+] Found manifest(s) under Drive segments folder:")
+        for i, m in enumerate(manifests, 1):
+            print(f"  {i}. {m}")
+        raw = input("Pick a number, or paste a manifest.json path directly: ").strip()
+        if raw.isdigit() and 1 <= int(raw) <= len(manifests):
+            return manifests[int(raw) - 1]
+        return raw
+    return input("Path to manifest.json: ").strip()
+
+
+def do_transcribe_mode(manifest_path: str = None):
+    manifest_path = manifest_path or resolve_manifest_choice()
+    if not os.path.exists(manifest_path):
+        print(f"[!] Manifest not found: {manifest_path}")
+        return
+    backend, style, fixed_language, workers = prompt_backend_choice()
+    transcripts_dirs = [DEFAULT_TRANSCRIPTS_DIR, os.path.dirname(manifest_path), os.getcwd()]
+    n = auto_transcribe_missing(
+        manifest_path, transcripts_dirs, backend, style,
+        fixed_language=fixed_language, parallel_workers=workers,
+    )
+    print(f"[+] Transcribed {n} segment(s).")
+
+
+# =========================================================================
+# REASSEMBLE MODE
+# =========================================================================
+def parse_transcript(path: str, fmt: str, seg_start_sec: float, seg_end_sec: float):
+    with open(path, "r", encoding="utf-8") as f:
+        content = f.read().strip()
+    if not content:
+        return []
+
+    if fmt == "colab":
+        lines_out = []
+        matched_any = False
+        for line in content.splitlines():
+            m = COLAB_LINE_RE.match(line.strip())
+            if m:
+                matched_any = True
+                rel_start, rel_end, text = float(m.group(1)), float(m.group(2)), m.group(3)
+                lines_out.append((seg_start_sec + rel_start, seg_start_sec + rel_end, text))
+        if matched_any:
+            return lines_out
+        return [(seg_start_sec, seg_end_sec, content)]
+
+    return [(seg_start_sec, seg_end_sec, content)]
+
+
+def format_srt_timestamp(seconds: float) -> str:
+    ms = int(round(seconds * 1000))
+    h, ms = divmod(ms, 3_600_000)
+    m, ms = divmod(ms, 60_000)
+    s, ms = divmod(ms, 1000)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def build_entries(manifest_path: str, transcripts_dirs: list):
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        manifest = json.load(f)
+
+    entries = []
+    missing_count = 0
+
+    for seg in manifest["segments"]:
+        path, fmt = find_transcript_file(seg["file"], transcripts_dirs)
+
+        if path is None:
+            missing_count += 1
+            entries.append({
+                "start": seg["start_sec"], "end": seg["end_sec"], "speaker": seg["speaker"],
+                "language": seg.get("language"), "text": "[MISSING TRANSCRIPT]", "source_segment": seg["file"],
+            })
+            continue
+
+        for abs_start, abs_end, text in parse_transcript(path, fmt, seg["start_sec"], seg["end_sec"]):
+            text = text.strip()
+            if not text:
+                continue
+            entries.append({
+                "start": round(abs_start, 3), "end": round(abs_end, 3), "speaker": seg["speaker"],
+                "language": seg.get("language"), "text": text, "source_segment": seg["file"],
+            })
+
+    entries.sort(key=lambda e: e["start"])
+    return entries, manifest, missing_count
+
+
+def write_outputs(entries: list, output_basename: str, source_file: str):
+    txt_path = f"{output_basename}.txt"
+    with open(txt_path, "w", encoding="utf-8") as f:
+        for e in entries:
+            lang_tag = f"[{e['language']}] " if e["language"] else ""
+            f.write(f"[{e['start']:.2f}s - {e['end']:.2f}s] [{e['speaker']}] {lang_tag}{e['text']}\n")
+
+    srt_path = f"{output_basename}.srt"
+    with open(srt_path, "w", encoding="utf-8") as f:
+        for i, e in enumerate(entries, start=1):
+            lang_tag = f"[{e['language']}] " if e["language"] else ""
+            f.write(f"{i}\n{format_srt_timestamp(e['start'])} --> {format_srt_timestamp(e['end'])}\n")
+            f.write(f"[{e['speaker']}] {lang_tag}{e['text']}\n\n")
+
+    json_path = f"{output_basename}.json"
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump({"source_file": source_file, "entries": entries}, f, indent=2)
+
+    print(f"[SUCCESS] Wrote {len(entries)} entrie(s):\n  {txt_path}\n  {srt_path}\n  {json_path}")
+    return txt_path, srt_path, json_path
+
+
+# --- TRANSLATION (deep-translator's GoogleTranslator - free, no API key) ---
+def ensure_translator_installed() -> bool:
+    try:
+        from deep_translator import GoogleTranslator  # noqa: F401
+        return True
+    except ImportError:
+        print("[+] Installing 'deep-translator' for the translation feature...")
+        try:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "deep-translator"])
+            return True
+        except Exception as e:
+            print(f"[!] Could not install deep-translator ({e}). Skipping translation.")
+            return False
+
+
+def prompt_translation_choice():
+    raw = input(
+        "\nWould you also like a translated version of the transcript? "
+        "Enter a target language code (e.g. 'es', 'fr', 'ja'), or press Enter to skip: "
+    ).strip()
+    if not raw:
+        return None
+    if not ensure_translator_installed():
+        return None
+    return raw.lower()
+
+
+def translate_entries(entries: list, target_lang: str) -> list:
+    """Translates each entry's text individually rather than one merged blob -
+    every entry already has exact timestamp/speaker boundaries from the
+    manifest, so there's no risk of the translator merging/splitting lines and
+    desyncing them from timestamps (the failure mode the original scripts had
+    to guard against with a length-mismatch fallback)."""
+    from deep_translator import GoogleTranslator
+    translator = GoogleTranslator(source="auto", target=target_lang)
+    texts = [e["text"] for e in entries]
+
+    try:
+        translated = translator.translate_batch(texts)
+    except Exception as e:
+        print(f"[!] Batch translation failed ({e}), falling back to one-by-one...")
+        translated = []
+        for t in texts:
+            try:
+                translated.append(translator.translate(t))
+            except Exception as e2:
+                print(f"[!] Translation error on a line, leaving it untranslated: {e2}")
+                translated.append(t)
+
+    if len(translated) != len(texts):
+        print("[!] Translated output length didn't match input - leaving text untranslated for safety.")
+        translated = texts
+
+    out_entries = []
+    for e, t in zip(entries, translated):
+        e2 = dict(e)
+        e2["original_text"] = e["text"]
+        e2["text"] = t if t else e["text"]
+        out_entries.append(e2)
+    return out_entries
+
+
+def reassemble(manifest_path: str, transcripts_dirs: list, output_basename: str, offer_translation: bool = True):
+    entries, manifest, missing_count = build_entries(manifest_path, transcripts_dirs)
+    source_file = manifest.get("source_file")
+
+    # Transcript compiler: if SPLIT used SepFormer pre-diarization splice,
+    # all times are on the longer spliced timeline — map them back to original.
+    splice_manifest = manifest.get("splice_manifest")
+    if splice_manifest and splice_manifest.get("splices"):
+        print("[+] Remapping timestamps from spliced timeline → original audio timeline...")
+        try:
+            entries = remap_entries_to_original(entries, splice_manifest)
+            print(f"[OK] Remapped {len(entries)} entr(y/ies) to original timeline.")
+        except Exception as e:
+            print(f"[!] Timestamp remap failed ({e}). Writing spliced-timeline times as-is.")
+
+    write_outputs(entries, output_basename, source_file)
+    if missing_count:
+        print(f"[!] {missing_count} segment(s) had no matching transcript file - marked [MISSING TRANSCRIPT].")
+
+    if offer_translation:
+        target_lang = prompt_translation_choice()
+        if target_lang:
+            print(f"[+] Translating to '{target_lang}'...")
+            translated_entries = translate_entries(entries, target_lang)
+            write_outputs(translated_entries, f"{output_basename}_{target_lang}", source_file)
+
+
+def do_reassemble_mode(manifest_path: str = None):
+    manifest_path = manifest_path or resolve_manifest_choice()
+    if not os.path.exists(manifest_path):
+        print(f"[!] Manifest not found: {manifest_path}")
+        return
+
+    default_dirs = [DEFAULT_TRANSCRIPTS_DIR, os.path.dirname(manifest_path), os.getcwd()]
+    transcripts_dirs = default_dirs
+
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        manifest = json.load(f)
+    still_missing = [s for s in manifest["segments"] if find_transcript_file(s["file"], transcripts_dirs)[0] is None]
+
+    if still_missing:
+        print(f"\n[+] {len(still_missing)} segment(s) don't have a transcript yet.")
+        auto = input("Auto-transcribe them now before reassembling? (Y/n): ").strip().lower() != "n"
+        if auto:
+            backend, style, fixed_language, workers = prompt_backend_choice()
+            auto_transcribe_missing(
+                manifest_path, transcripts_dirs, backend, style,
+                fixed_language=fixed_language, parallel_workers=workers,
+            )
+
+    out_dir = os.path.dirname(manifest_path)
+    default_output = os.path.join(out_dir, "final_transcript")
+    raw = input(f"Output basename (default: {default_output}): ").strip()
+    output_basename = raw or default_output
+
+    reassemble(manifest_path, transcripts_dirs, output_basename)
+    # Models may have been loaded by the auto-transcribe path above
+    unload_transcribe_models()
+    unload_langid_model()
+    free_memory(aggressive=True)
+
+
+# =========================================================================
+# CLEANUP
+# =========================================================================
+def cleanup_local_audio(aggressive: bool = False, manifest_paths: list = None):
+    """Remove bulk audio that is no longer needed.
+    - Always: purge TEMP_SLICES_DIR and any leftover temporary files.
+    - Light (default): also remove DOWNLOAD_DIR contents and NORMALIZED_DIR.
+    - Aggressive: additionally remove any leftover per-turn WAVs under the
+      given manifest directories (or the whole SEGMENTS_ROOT tree of WAVs),
+      leaving only manifest.json + text transcripts on Drive.
+
+    Never deletes transcripts, final outputs, tokens, or keys.
+    """
+    import glob as _glob
+
+    removed_bytes = 0
+    removed_files = 0
+
+    def _rm(path):
+        nonlocal removed_bytes, removed_files
+        try:
+            if os.path.isfile(path):
+                removed_bytes += os.path.getsize(path)
+                os.remove(path)
+                removed_files += 1
+            elif os.path.isdir(path):
+                shutil.rmtree(path, ignore_errors=True)
+        except OSError:
+            pass
+
+    # 1. Always clear short-lived slices
+    if os.path.isdir(TEMP_SLICES_DIR):
+        for f in _glob.glob(os.path.join(TEMP_SLICES_DIR, "*")):
+            _rm(f)
+
+    if not aggressive:
+        for d in (DOWNLOAD_DIR, NORMALIZED_DIR):
+            if os.path.isdir(d):
+                for f in _glob.glob(os.path.join(d, "*")):
+                    _rm(f)
+        print(f"[+] Light cleanup: removed {removed_files} local audio file(s) "
+              f"({removed_bytes / 1_000_000:.1f} MB). Manifests + transcripts kept.")
+        return
+
+    # Aggressive: also drop any permanent per-turn WAVs that may exist
+    targets = []
+    if manifest_paths:
+        for mp in manifest_paths:
+            d = os.path.dirname(mp)
+            targets.extend(_glob.glob(os.path.join(d, "seg_*.wav")))
+    else:
+        targets = _glob.glob(os.path.join(SEGMENTS_ROOT, "*", "seg_*.wav"))
+
+    for f in targets:
+        _rm(f)
+
+    for d in (DOWNLOAD_DIR, NORMALIZED_DIR):
+        if os.path.isdir(d):
+            for f in _glob.glob(os.path.join(d, "*")):
+                _rm(f)
+
+    print(f"[+] Aggressive cleanup: removed {removed_files} audio file(s) "
+          f"({removed_bytes / 1_000_000:.1f} MB). Only manifests + text transcripts remain.")
+
+
+def prompt_and_cleanup(manifest_paths: list = None):
+    """Ask the user whether (and how aggressively) to clean up local audio."""
+    print("\n[+] Cleanup options (frees Colab / local disk and avoids filling Drive):")
+    print("  1. Light   – delete downloads, normalized full audio, and temp slices")
+    print("  2. Aggressive – also delete any leftover per-turn WAVs (keeps only manifests + transcripts)")
+    print("  3. Skip")
+    raw = input("Choose 1-3 (default 1): ").strip()
+    if raw == "3":
+        print("[+] Skipping cleanup.")
+        return
+    aggressive = raw == "2"
+    cleanup_local_audio(aggressive=aggressive, manifest_paths=manifest_paths)
+
+
+# =========================================================================
+# FULL RUN MODE
+# =========================================================================
+def do_full_run():
+    manifest_paths = do_split_mode(prompt_for_settings=True)
+    if not manifest_paths:
+        print("[!] Split produced nothing to transcribe. Stopping.")
+        return
+
+    # Explicit free after split – diarization pipeline + langid already unloaded
+    # inside split_file / run_diarization, but make sure nothing lingers
+    free_memory(aggressive=True)
+
+    backend, style, fixed_language, workers = prompt_backend_choice()
+    target_lang = prompt_translation_choice()
+
+    for mp in manifest_paths:
+        transcripts_dirs = [DEFAULT_TRANSCRIPTS_DIR, os.path.dirname(mp), os.getcwd()]
+        auto_transcribe_missing(
+            mp, transcripts_dirs, backend, style,
+            fixed_language=fixed_language, parallel_workers=workers,
+        )
+        out_dir = os.path.dirname(mp)
+        output_basename = os.path.join(out_dir, "final_transcript")
+
+        entries, manifest, missing_count = build_entries(mp, transcripts_dirs)
+        splice_manifest = manifest.get("splice_manifest")
+        if splice_manifest and splice_manifest.get("splices"):
+            print("[+] Remapping timestamps from spliced timeline → original audio timeline...")
+            try:
+                entries = remap_entries_to_original(entries, splice_manifest)
+                print(f"[OK] Remapped {len(entries)} entr(y/ies) to original timeline.")
+            except Exception as e:
+                print(f"[!] Timestamp remap failed ({e}). Writing spliced-timeline times as-is.")
+        write_outputs(entries, output_basename, manifest.get("source_file"))
+        if missing_count:
+            print(f"[!] {missing_count} segment(s) had no matching transcript file - marked [MISSING TRANSCRIPT].")
+        if target_lang:
+            print(f"[+] Translating to '{target_lang}'...")
+            translated_entries = translate_entries(entries, target_lang)
+            write_outputs(translated_entries, f"{output_basename}_{target_lang}", manifest.get("source_file"))
+
+    # Final model teardown + cleanup
+    unload_transcribe_models()
+    unload_langid_model()
+    free_memory(aggressive=True)
+    prompt_and_cleanup(manifest_paths)
+
+
+# =========================================================================
+# MAIN
+# =========================================================================
+def main():
+    print("Which step do you want to run?")
+    print("  0. PREP        - download + normalize only (CPU runtime, no GPU/TPU used)")
+    print("  1. SPLIT       - diarize (writes lightweight timestamp manifest only)")
+    print("  2. TRANSCRIBE  - auto-transcribe missing segments (reconstructs audio on demand)")
+    print("  3. REASSEMBLE  - stitch transcribed segments into one transcript (auto-fills gaps)")
+    print("  4. FULL RUN    - split -> transcribe -> reassemble + cleanup")
+    choice = input("Choose 0-4: ").strip()
+
+    if choice == "0":
+        do_prep_mode()
+    elif choice == "1":
+        do_split_mode()
+    elif choice == "2":
+        do_transcribe_mode()
+    elif choice == "3":
+        do_reassemble_mode()
+        prompt_and_cleanup()
+    elif choice == "4":
+        do_full_run()
+    else:
+        print("[!] Please enter a number 0-4.")
+
+
+if __name__ == "__main__":
+    main()
