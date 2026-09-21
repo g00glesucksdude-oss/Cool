@@ -40,6 +40,13 @@ GSteps := [
     ["1",       0]
 ]
 
+; C sequence
+CSteps := [
+    ["6",       SwapMs],
+    ["RButton", ClickMs],
+    ["1",       0]
+]
+
 ; R toggle: opener once, then pattern loops until R is pressed again
 ROpen := [
     ["6",       SwapMs],
@@ -105,6 +112,10 @@ OnExit(Cleanup)
 *g:: {
     if !Spam
         RunSeq(GSteps, false)
+}
+*c:: {
+    if !Spam
+        RunSeq(CSteps, false)
 }
 *r:: {
     global Spam := !Spam
