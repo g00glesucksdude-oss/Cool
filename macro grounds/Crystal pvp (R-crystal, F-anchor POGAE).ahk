@@ -8,6 +8,7 @@ if !A_IsAdmin {
 }
 
 SendMode "Event"
+CoordMode "Mouse", "Screen"
 SetKeyDelay -1, -1
 SetMouseDelay -1
 ProcessSetPriority "High"
@@ -17,6 +18,10 @@ SwapMs  := 65
 ClickMs := 55
 LookMs  := 40      ; wait after a look move
 LookPx  := 40      ; look distance in pixels, tune to your sensitivity
+ChordMs := 35      ; window to catch Shift+L+R (adds this delay to every L/R click)
+InvMs   := 250     ; wait for the inventory to open (raise if it still grabs the wrong item)
+OvAlpha := 40      ; recording overlay darkness (0-255)
+PlayOffY := 5      ; playback clicks land this many pixels below the recorded spot
 
 ; A/D strafe: angle below horizontal (45 = even, 85 = almost straight down)
 StrafeAng := 85
@@ -89,13 +94,25 @@ ViewUp := false
 Armed := false                  ; true after F finishes, until your next right-click
 Held := ""
 
+Rec  := false                   ; recording mode
+Busy := false                   ; inventory playback running
+Locs := []                      ; recorded click positions [x, y]
+Swal := Map("L", false, "R", false)   ; physical button down was swallowed -> swallow its release
+Fwd  := Map("L", false, "R", false)   ; we forwarded a down -> forward its release
+
+; Recording overlay: covers the game, catches clicks so the game never sees them
+ov := Gui("+AlwaysOnTop -Caption +ToolWindow -DPIScale")
+ov.BackColor := "000000"
+OnMessage(0x201, OvClick)       ; WM_LBUTTONDOWN
+
 DllCall("winmm\timeBeginPeriod", "UInt", 1)
 OnExit(Cleanup)
 
 +Esc:: ExitApp                  ; Shift+Esc, works anytime
 
 ~LControl Up:: {
-    global Enabled := !Enabled, Spam := false, Armed := false
+    global Enabled := !Enabled
+    ResetState()
     ToolTip("Macro " (Enabled ? "ON" : "OFF"))
     SetTimer(ToolTip, -800)
 }
@@ -117,6 +134,7 @@ OnExit(Cleanup)
     if !Spam
         RunSeq(CSteps, false)
 }
+*v:: Playback()
 *r:: {
     global Spam := !Spam
     if Spam
@@ -130,15 +148,146 @@ OnExit(Cleanup)
     else if GetKeyState("d", "P")
         RunSeq(MSpecialD, false)
 }
+
+; Physical L/R clicks are swallowed here (no ~), then forwarded unless they form a Shift+L+R chord
+*LButton:: ClickDown("L")
+*RButton:: ClickDown("R")
+#HotIf Enabled && WinActive(GameWin) && (Swal["L"] || Fwd["L"])
+*LButton Up:: ClickUp("L")
+#HotIf Enabled && WinActive(GameWin) && (Swal["R"] || Fwd["R"])
+*RButton Up:: ClickUp("R")
 #HotIf
 
-; Your first physical right-click after F -> press 1 (script clicks don't trigger this)
-#HotIf Enabled && Armed && WinActive(GameWin)
-~RButton Up:: {
-    global Armed := false
-    Tap("1")
+; ---------------- click handling / recording / playback ----------------
+
+ClickDown(b) {
+    Swal[b] := true
+    if Busy
+        return
+    bn := b "Button"
+    ob := (b = "L" ? "R" : "L") "Button"
+    t := A_TickCount
+    while GetKeyState(bn, "P") && A_TickCount - t < ChordMs {
+        if GetKeyState(ob, "P") && GetKeyState("Shift", "P") {
+            if !Rec
+                StartRec()
+            return
+        }
+        Sleep 1
+    }
+    Swal[b] := false                                ; not a chord: pass it on as a normal click
+    Fwd[b] := true
+    Send "{" bn " down}"
+    if !GetKeyState(bn, "P") {                      ; already released during the window
+        Sleep HoldMs
+        FwdUp(b)
+    }
 }
-#HotIf
+
+ClickUp(b) {
+    if Fwd[b]
+        FwdUp(b)
+    else
+        Swal[b] := false
+}
+
+FwdUp(b) {
+    global Armed
+    if !Fwd[b]
+        return
+    Send "{" b "Button up}"
+    Fwd[b] := false
+    if b = "R" && Armed {                           ; first right-click after F -> slot 1
+        Armed := false
+        Tap("1")
+    }
+}
+
+StartRec() {
+    global Rec := true
+    Locs.Length := 0
+    Swal["L"] := false                              ; game loses focus now, so its Up hotkeys go inactive
+    Swal["R"] := false
+    try
+        WinGetPos &x, &y, &w, &h, GameWin
+    catch {
+        x := 0, y := 0, w := A_ScreenWidth, h := A_ScreenHeight
+    }
+    ov.Show("x" x " y" y " w" w " h" h)
+    WinSetTransparent OvAlpha, "ahk_id " ov.Hwnd
+    ToolTip("REC - click items, release Shift to stop")
+    SetTimer(RecWatch, 15)
+}
+
+OvClick(wParam, lParam, msg, hwnd) {
+    if !Rec || hwnd != ov.Hwnd
+        return
+    MouseGetPos &x, &y
+    Locs.Push([x, y])
+    ToolTip("REC: " Locs.Length)
+}
+
+RecWatch() {
+    if GetKeyState("Shift", "P")
+        return
+    global Rec := false
+    SetTimer(RecWatch, 0)
+    ov.Hide()
+    try WinActivate GameWin
+    ToolTip("Saved " Locs.Length " click(s)")
+    SetTimer(ToolTip, -1000)
+}
+
+Playback() {
+    global Busy
+    if Busy || Spam || Rec
+        return
+    if Locs.Length = 0 {
+        ToolTip("No saved clicks")
+        SetTimer(ToolTip, -800)
+        return
+    }
+    Busy := true
+    loc := Locs.RemoveAt(1)                         ; use it up, next one is ready for next time
+    try {
+        Tap("e")
+        Sleep InvMs
+        MouseMove loc[1], loc[2] + PlayOffY, 0
+        Sleep ClickMs
+        ShiftClick()
+        Sleep ClickMs
+        Tap("e")
+    } finally
+        Busy := false
+    ToolTip(Locs.Length " left")
+    SetTimer(ToolTip, -800)
+}
+
+ShiftClick() {
+    global Held := "LShift"
+    Send "{LShift down}"
+    Sleep HoldMs
+    Send "{LButton down}"
+    Sleep HoldMs
+    Send "{LButton up}"
+    Sleep HoldMs
+    Send "{LShift up}"
+    Held := ""
+}
+
+ResetState() {
+    global Rec := false, Spam := false, Armed := false
+    SetTimer(RecWatch, 0)
+    ov.Hide()
+    for b in ["L", "R"] {
+        if Fwd[b]
+            Send "{" b "Button up}"
+        Fwd[b] := false
+        Swal[b] := false
+    }
+}
+
+; ---------------- sequences ----------------
 
 SpamLoop() {
     RunSeq(ROpen, true)
@@ -195,5 +344,8 @@ Tap(k) {
 Cleanup(*) {
     if Held != ""
         Send "{" Held " up}"
+    for b in ["L", "R"]
+        if Fwd[b]
+            Send "{" b "Button up}"
     DllCall("winmm\timeEndPeriod", "UInt", 1)
 }
