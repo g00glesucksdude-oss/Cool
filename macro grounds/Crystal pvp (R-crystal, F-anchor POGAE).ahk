@@ -13,13 +13,13 @@ SetKeyDelay -1, -1
 SetMouseDelay -1
 ProcessSetPriority "High"
 
-HoldMs  := 35
-SwapMs  := 65
-ClickMs := 55
+HoldMs  := 10
+SwapMs  := 5
+ClickMs := 5
 LookMs  := 40      ; wait after a look move
 LookPx  := 40      ; look distance in pixels, tune to your sensitivity
-ChordMs := 35      ; window to catch Shift+L+R (adds this delay to every L/R click)
-InvMs   := 250     ; wait for the inventory to open (raise if it still grabs the wrong item)
+ChordMs := 25      ; window to catch Shift+L+R (adds this delay to every L/R click)
+InvMs   := 250       ; wait for the inventory to open (raise if it still grabs the wrong item)
 OvAlpha := 40      ; recording overlay darkness (0-255)
 PlayOffY := 5      ; playback clicks land this many pixels below the recorded spot
 
