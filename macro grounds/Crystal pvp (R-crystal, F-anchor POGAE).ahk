@@ -23,12 +23,10 @@ InvMs   := 250       ; wait for the inventory to open (raise if it still grabs t
 OvAlpha := 40      ; recording overlay darkness (0-255)
 PlayOffY := 5      ; playback clicks land this many pixels below the recorded spot
 
-; A/D strafe: angle below horizontal (45 = even, 85 = almost straight down)
-StrafeAng := 85
-StrafePx  := 250   ; total flick length in pixels
-Rad       := StrafeAng * 3.14159265358979 / 180
-StrafeDX  := Round(StrafePx * Cos(Rad))
-StrafeDY  := Round(StrafePx * Sin(Rad))
+; R mode 2 timing (much faster than the rest, raise these if the game starts missing inputs)
+M2Hold := 2        ; key/button hold time
+M2Wait := 4        ; wait after each swap/click
+M2Look := 12       ; wait after the look-up before hitting the crystal
 
 ; F sequence
 FSteps := [
@@ -52,7 +50,16 @@ CSteps := [
     ["1",       0]
 ]
 
-; R toggle: opener once, then pattern loops until R is pressed again
+; Slots: 1 sword, 5 pearl, 6 obsidian, 7 glowstone, 8 anchor, 9 crystal
+
+; Middle click: throw pearl, back to sword
+PSteps := [
+    ["5",       SwapMs],
+    ["RButton", ClickMs],
+    ["1",       0]
+]
+
+; R mode 1 (default): obsidian opener once, then crystal loop until R is pressed again
 ROpen := [
     ["6",       SwapMs],
     ["RButton", ClickMs]
@@ -66,30 +73,25 @@ RPattern := [
     ["LookDown", LookMs]
 ]
 
-; Middle click special cases (A or D held): one-shot
-MSpecialA := [                   ; A held: down-right
-    ["DiagRight", LookMs],
-    ["6",         SwapMs],
-    ["RButton",   ClickMs],
-    ["9",         SwapMs],
-    ["RButton",   ClickMs],
-    ["UpBack",    LookMs],
-    ["LButton",   0]
-]
-
-MSpecialD := [                   ; D held: down-left
-    ["DiagLeft",  LookMs],
-    ["6",         SwapMs],
-    ["RButton",   ClickMs],
-    ["9",         SwapMs],
-    ["RButton",   ClickMs],
-    ["UpBack",    LookMs],
-    ["LButton",   0]
+; R mode 2 (toggle with Shift+R): one-shot, obsidian x2, crystal, hit it, back to sword
+RTwo := [
+    ["6",        M2Wait],
+    ["RButton",  M2Wait],
+    ["6",        M2Wait],
+    ["RButton",  M2Wait],
+    ["9",        M2Wait],
+    ["RButton",  M2Wait],
+    ["LookUp",   M2Look],
+    ["LButton",  M2Wait],
+    ["LookDown", M2Wait],
+    ["1",        0]
 ]
 
 GameWin := "ahk_exe Minecraft.Windows.exe"
 Enabled := false
 Spam := false
+RDown := false                    ; R is physically held (blocks key auto-repeat)
+RMode2 := false                  ; Shift+R toggles: false = crystal loop, true = obsidian x2 one-shot
 ViewUp := false
 Armed := false                  ; true after F finishes, until your next right-click
 Held := ""
@@ -134,24 +136,38 @@ OnExit(Cleanup)
     if !Spam
         RunSeq(CSteps, false)
 }
+*MButton:: {
+    if !Spam
+        RunSeq(PSteps, false)
+}
 *v:: Playback()
 *r:: {
-    global Spam := !Spam
-    if Spam
-        SetTimer(SpamLoop, -1)
-}
-*MButton:: {
-    if Spam
+    global Spam, RMode2, RDown
+    if RDown                                        ; ignore key auto-repeat
         return
-    if GetKeyState("a", "P")
-        RunSeq(MSpecialA, false)
-    else if GetKeyState("d", "P")
-        RunSeq(MSpecialD, false)
+    RDown := true
+    if GetKeyState("Shift", "P") {
+        RMode2 := !RMode2
+        Spam := false                               ; switching modes always kills any running loop
+        ToolTip("R mode: " (RMode2 ? "2 (one-shot)" : "1 (obsidian + crystal loop)"))
+        SetTimer(ToolTip, -800)
+    } else if Spam {
+        Spam := false                               ; stop a running loop (mode 1 only)
+    } else if RMode2 {
+        RunSeq(RTwo, false, M2Hold)                 ; mode 2: run once, never loops
+    } else {
+        Spam := true                                ; mode 1: loop until R is pressed again
+        SetTimer(SpamLoop, -1)
+    }
 }
 
 ; Physical L/R clicks are swallowed here (no ~), then forwarded unless they form a Shift+L+R chord
 *LButton:: ClickDown("L")
 *RButton:: ClickDown("R")
+#HotIf Enabled
+~*r Up:: {
+    global RDown := false
+}
 #HotIf Enabled && WinActive(GameWin) && (Swal["L"] || Fwd["L"])
 *LButton Up:: ClickUp("L")
 #HotIf Enabled && WinActive(GameWin) && (Swal["R"] || Fwd["R"])
@@ -276,7 +292,7 @@ ShiftClick() {
 }
 
 ResetState() {
-    global Rec := false, Spam := false, Armed := false
+    global Rec := false, Spam := false, Armed := false, RDown := false
     SetTimer(RecWatch, 0)
     ov.Hide()
     for b in ["L", "R"] {
@@ -297,17 +313,17 @@ SpamLoop() {
         Do("LookDown")
 }
 
-RunSeq(steps, abortable) {
+RunSeq(steps, abortable, hold := "") {
     for step in steps {
         if abortable && !Spam
             return
-        Do(step[1])
+        Do(step[1], hold)
         if step[2]
             Sleep step[2]
     }
 }
 
-Do(a) {
+Do(a, hold := "") {
     global ViewUp
     switch a {
         case "LookUp":
@@ -320,23 +336,17 @@ Do(a) {
             Look(0, LookPx)
             ViewUp := false
         }
-        case "DiagRight":
-            Look(StrafeDX, StrafeDY)
-        case "DiagLeft":
-            Look(-StrafeDX, StrafeDY)
-        case "UpBack":
-            Look(0, -StrafeDY)
         default:
-            Tap(a)
+            Tap(a, hold)
     }
 }
 
 Look(dx, dy) => DllCall("mouse_event", "UInt", 1, "Int", dx, "Int", dy, "UInt", 0, "UPtr", 0)
 
-Tap(k) {
+Tap(k, hold := "") {
     global Held := k
     Send "{" k " down}"
-    Sleep HoldMs
+    Sleep (hold = "" ? HoldMs : hold)
     Send "{" k " up}"
     Held := ""
 }
