@@ -1,71 +1,23 @@
 #!/usr/bin/env python3
 """
-YouTube Playlist Scraper — single-file GUI edition.
+YouTube Playlist Scraper — single-file GUI + phone sync.
 
-Paste playlist links in, each one gets its own card with its own folder
-and its own "Update Video" button. Hitting Update only pulls videos that
-weren't downloaded yet (tracked via a per-playlist archive file), so you
-can re-check a playlist anytime without re-downloading everything.
+Paste playlist links → each gets a card with its own folder.
+  • Update Video / Audio Only  — only fetches what's missing (archive + manifest).
+  • Redownload #               — force one position.
+  • Auto-update                — set from the phone page.
+  • Phone / LAN page           — open the link on any device on the same Wi-Fi:
+        - live status & progress
+        - Play / Save every file
+        - Sync button: pick a folder on the phone, then only missing files
+          are streamed into it (Chrome / Edge recommended).
 
-Each card also has:
-  - "Audio Only"   — pulls just the audio (mp3) for the whole playlist,
-                      tracked with its own separate archive so it doesn't
-                      interfere with the video archive.
-  - "Redownload #" — type a playlist position (e.g. 63) and it forces a
-                      fresh redownload of just that one item.
-
-There's also a standalone Subtitle Downloader at the top of the window —
-paste any YouTube video or playlist link and it grabs subtitles (manual
-if available, otherwise auto-generated) into downloads/subtitles/. If a
-video has no subtitles at all, it'll tell you that and point you at your
-offline transcriber project instead.
-
---- NEW: PHONE / LAN ACCESS ---
-Whenever this PC has a network connection, the app starts a small web
-server. It remembers the last port it used (saved in downloads/server_port.txt)
-and reuses that port when possible, so the phone link stays the same across
-restarts. If that port is taken it picks a new free one and saves that instead.
-The address is shown at the top of the window (with a "Copy link" button).
-Open that address on any device on the same Wi-Fi/network and you get a page with:
-  - every playlist, its videos and its audio, each with Play / Save
-  - "Update videos" / "Update audio" buttons that run the update on this PC
-    and show live progress
-  - an Auto-update picker (every 30 min … every day) per playlist
-The server stops when the PC goes offline and starts again (preferring the
-saved port) when it comes back. Anyone on your network who has the link can
-use it, so only run it on networks you trust.
-
---- NEW: DELETING THINGS ---
-  * Delete a downloaded file from disk  -> the next update notices it's gone
-    and downloads it again (as long as the video is still in the playlist).
-  * Remove a video from the YouTube playlist -> the next update leaves it
-    completely alone: it is not downloaded again, not regenerated, and the
-    copy you already have stays on disk (and stays visible on the phone page).
-To tell which file belongs to which video, the app now keeps a small
-.manifest.json in each playlist folder. Playlists downloaded before this
-update are matched to their files by title the first time, so nothing gets
-re-downloaded unless the file is truly missing.
+Data lives only in downloads/ next to this script, so you can replace the .py
+anytime without losing playlists, archives, or the saved port.
 
 Requires:
     pip install -U yt-dlp
-Also needs ffmpeg on your PATH (for merging video+audio and for
-extracting audio-only tracks):
-    Mac:     brew install ffmpeg
-    Linux:   sudo apt install ffmpeg
-    Windows: https://ffmpeg.org/download.html
-
-Run:
-    python playlist_scraper.py
-
---- YOUR DATA IS SAFE ACROSS UPDATES ---
-Everything this app remembers — your playlist list (downloads/playlists.json),
-the last phone-access port (downloads/server_port.txt), each playlist's list
-of already-downloaded videos (the .downloaded.txt file inside each playlist
-folder), each playlist's audio archive (downloads/<playlist>/audio/
-.downloaded_audio.txt) and the new .manifest.json — lives in the downloads/
-folder next to this script, completely separate from the script's code.
-Replace this .py with a newer version and leave downloads/ alone; playlists.json
-keeps the same format (it only gains an optional "auto_minutes" field).
+    ffmpeg on PATH
 """
 
 import http.server
@@ -76,9 +28,11 @@ import random
 import re
 import socket
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
+import zipfile
 import tkinter as tk
 from tkinter import ttk, messagebox
 
@@ -97,17 +51,31 @@ os.makedirs(BASE_DIR, exist_ok=True)
 VIDEO_EXTS = {".mp4", ".mkv", ".webm", ".m4v", ".mov"}
 AUDIO_EXTS = {".mp3", ".m4a", ".opus", ".ogg", ".aac", ".flac", ".wav"}
 AUTO_CHOICES = (0, 30, 60, 180, 360, 720, 1440)  # minutes; 0 = off
-PORT_RANGE = (49152, 65535)  # the "private" range, unlikely to clash with anything
+PORT_RANGE = (49152, 65535)
 MANIFEST_LOCK = threading.Lock()
 
+COMMON_YDL_OPTS = {
+    "retries": 10,
+    "fragment_retries": 10,
+    "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
+    "http_headers": {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    },
+}
+
+_TEMP_STEM = re.compile(r"\.(f\d+|temp)$")
+_INDEX_PREFIX = re.compile(r"^\d+\s*-\s*")
+
+
+# ---------------------------------------------------------------------------
+# Small helpers
+# ---------------------------------------------------------------------------
 
 def load_saved_port():
-    """Return the last successfully used port, or None."""
     try:
         with open(PORT_FILE, "r", encoding="utf-8") as f:
             p = int(f.read().strip())
-        lo, hi = PORT_RANGE
-        if lo <= p <= hi:
+        if PORT_RANGE[0] <= p <= PORT_RANGE[1]:
             return p
     except Exception:
         pass
@@ -121,16 +89,6 @@ def save_port(port):
     except Exception:
         pass
 
-COMMON_YDL_OPTS = {
-    # --- helps avoid intermittent HTTP 403s from YouTube ---
-    "retries": 10,
-    "fragment_retries": 10,
-    "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
-    "http_headers": {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-    },
-}
-
 
 def sanitize_name(name: str) -> str:
     keep = "-_.() "
@@ -140,21 +98,20 @@ def sanitize_name(name: str) -> str:
 def load_config():
     if os.path.exists(CONFIG_FILE):
         try:
-            with open(CONFIG_FILE, "r") as f:
-                return json.load(f)
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                return data
         except Exception:
-            return []
+            pass
     return []
 
 
 def save_config(playlists):
-    with open(CONFIG_FILE, "w") as f:
+    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(playlists, f, indent=2)
 
 
-# ----------------------------------------------------------------------
-# Archive / manifest helpers (this is what makes delete-sync work)
-# ----------------------------------------------------------------------
 def describe_minutes(m):
     if m < 60:
         return f"{m} min"
@@ -169,7 +126,6 @@ def norm_title(s):
 
 
 def read_archive_ids(path):
-    """yt-dlp archive lines look like 'youtube VIDEOID'. Returns the ids, in order, no dupes."""
     ids = []
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -177,8 +133,6 @@ def read_archive_ids(path):
                 parts = ln.split()
                 if len(parts) >= 2:
                     ids.append(parts[-1])
-    except FileNotFoundError:
-        pass
     except Exception:
         pass
     return list(dict.fromkeys(ids))
@@ -222,12 +176,7 @@ def save_manifest(folder, manifest):
         pass
 
 
-_TEMP_STEM = re.compile(r"\.(f\d+|temp)$")
-_INDEX_PREFIX = re.compile(r"^\d+\s*-\s*")
-
-
 def scan_media(folder, exts, with_size=True):
-    """Finished media files directly inside folder (no hidden/temp/partial files)."""
     out = []
     try:
         with os.scandir(folder) as it:
@@ -245,8 +194,6 @@ def scan_media(folder, exts, with_size=True):
 
 
 def index_files_by_title(folder, exts):
-    """{normalized title: filename}, ignoring the 'NNN - ' index prefix, so files still
-    match after the playlist positions shift."""
     result = {}
     for f in scan_media(folder, exts, with_size=False):
         stem = os.path.splitext(f["name"])[0]
@@ -257,7 +204,6 @@ def index_files_by_title(folder, exts):
 
 
 def fetch_entries(url):
-    """Cheap look at what is in the playlist *right now*: [{'id', 'title', 'index'}]."""
     opts = {"quiet": True, "no_warnings": True, "extract_flat": True, "skip_download": True}
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=False)
@@ -276,15 +222,30 @@ def entries_of(info):
     return [info]
 
 
+def get_lan_ip():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.settimeout(1)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+    except OSError:
+        return None
+    finally:
+        s.close()
+    return None if not ip or ip.startswith("127.") or ip == "0.0.0.0" else ip
+
+
+# ---------------------------------------------------------------------------
+# Playlist card (GUI + shared state for the web server)
+# ---------------------------------------------------------------------------
+
 class PlaylistCard(ttk.Frame):
     def __init__(self, master, app, data):
         super().__init__(master, padding=10, relief="groove", borderwidth=1)
         self.app = app
-        self.data = data  # {"url":..., "title":..., "folder":..., optional "auto_minutes":...}
+        self.data = data
         self.busy = False
         self._busy_lock = threading.Lock()
-        # Plain-Python mirrors of what the card shows, so the web server thread
-        # can read them without touching Tk from another thread.
         self.status_text = "Not downloaded yet"
         self.progress_value = 0.0
         self.current_kind = None
@@ -292,19 +253,15 @@ class PlaylistCard(ttk.Frame):
 
         top = ttk.Frame(self)
         top.pack(fill="x")
-
         self.title_label = ttk.Label(top, text=data["title"], font=("Segoe UI", 11, "bold"))
         self.title_label.pack(side="left")
 
         btns = ttk.Frame(self)
         btns.pack(fill="x", pady=(4, 0))
-
         self.update_btn = ttk.Button(btns, text="Update Video", command=lambda: self.start_jobs(["video"]))
         self.update_btn.pack(side="left")
-
         self.audio_btn = ttk.Button(btns, text="Audio Only", command=lambda: self.start_jobs(["audio"]))
         self.audio_btn.pack(side="left", padx=6)
-
         ttk.Button(btns, text="Open Folder", command=self.open_folder).pack(side="left", padx=6)
         ttk.Button(btns, text="Remove", command=self.remove).pack(side="left")
 
@@ -324,17 +281,11 @@ class PlaylistCard(ttk.Frame):
         self.status_var = tk.StringVar(value=self.status_text)
         ttk.Label(self, textvariable=self.status_var, foreground="#555", wraplength=500,
                   justify="left").pack(fill="x", pady=(6, 0))
-
         self.progress = ttk.Progressbar(self, mode="determinate", maximum=100)
         self.progress.pack(fill="x", pady=(4, 0))
 
-    # ------------------------------------------------------------------
-    # Small shared helpers
-    # ------------------------------------------------------------------
     def kind_folder(self, kind):
-        if kind == "audio":
-            return os.path.join(self.data["folder"], "audio")
-        return self.data["folder"]
+        return os.path.join(self.data["folder"], "audio") if kind == "audio" else self.data["folder"]
 
     def archive_path(self, kind):
         if kind == "audio":
@@ -345,7 +296,7 @@ class PlaylistCard(ttk.Frame):
         try:
             self.app.root.after(0, fn)
         except Exception:
-            pass  # window already closed
+            pass
 
     def set_status(self, text):
         self.status_text = text
@@ -366,7 +317,8 @@ class PlaylistCard(ttk.Frame):
             os.system(f'xdg-open "{path}"')
 
     def remove(self):
-        if messagebox.askyesno("Remove playlist", f"Remove '{self.data['title']}' from the list?\n(Downloaded files stay on disk.)"):
+        if messagebox.askyesno("Remove playlist",
+                               f"Remove '{self.data['title']}' from the list?\n(Downloaded files stay on disk.)"):
             self.app.remove_playlist(self)
 
     def _lock_buttons(self):
@@ -386,9 +338,6 @@ class PlaylistCard(ttk.Frame):
             self.busy = True
             return True
 
-    # ------------------------------------------------------------------
-    # Auto-update (set from the phone page, runs on this PC)
-    # ------------------------------------------------------------------
     def _refresh_auto_label(self):
         m = self.data.get("auto_minutes", 0)
         self.auto_var.set("Auto-update: off" if not m else f"Auto-update: every {describe_minutes(m)}")
@@ -404,9 +353,6 @@ class PlaylistCard(ttk.Frame):
         self._refresh_auto_label()
         self.app.persist()
 
-    # ------------------------------------------------------------------
-    # What the phone page sees
-    # ------------------------------------------------------------------
     def list_files(self):
         return {
             "video": scan_media(self.kind_folder("video"), VIDEO_EXTS),
@@ -425,9 +371,8 @@ class PlaylistCard(ttk.Frame):
             "audios": len(scan_media(self.kind_folder("audio"), AUDIO_EXTS, with_size=False)),
         }
 
-    # ------------------------------------------------------------------
-    # Manifest + archive sync
-    # ------------------------------------------------------------------
+    # -- manifest / archive ------------------------------------------------
+
     def _record_file(self, kind, vid, fname):
         with MANIFEST_LOCK:
             manifest = load_manifest(self.data["folder"])
@@ -435,7 +380,6 @@ class PlaylistCard(ttk.Frame):
             save_manifest(self.data["folder"], manifest)
 
     def _record_from_info(self, kind, info):
-        """Belt and braces: after a run, note the final file of everything yt-dlp just wrote."""
         done = set()
         for e in entries_of(info):
             for rd in e.get("requested_downloads") or []:
@@ -468,18 +412,6 @@ class PlaylistCard(ttk.Frame):
         return hook
 
     def _sync_archive(self, kind, entries):
-        """
-        Make the 'already downloaded' archive match what is really on disk, using the
-        playlist as it is right now.
-
-        - in playlist, file still on disk         -> nothing to do
-        - in playlist, file gone from disk        -> forget it, so yt-dlp downloads it again
-        - no longer in the playlist (any state)   -> left completely alone: never
-                                                     re-downloaded, never restored,
-                                                     existing file untouched
-
-        Returns (restored_count, left_alone_count).
-        """
         folder = self.kind_folder(kind)
         archive = self.archive_path(kind)
         archived = read_archive_ids(archive)
@@ -502,7 +434,6 @@ class PlaylistCard(ttk.Frame):
                 fname = section.get(vid)
                 if fname and os.path.isfile(os.path.join(folder, fname)):
                     continue
-                # No record (older download) or the recorded name is gone: try the title.
                 found = by_title.get(norm_title(entry["title"])) if entry["title"] else None
                 if found:
                     section[vid] = found
@@ -514,12 +445,9 @@ class PlaylistCard(ttk.Frame):
         drop_from_archive(archive, missing)
         return len(missing), left_alone
 
-    # ------------------------------------------------------------------
-    # Video / audio update (one code path for both)
-    # ------------------------------------------------------------------
+    # -- update jobs -------------------------------------------------------
+
     def start_jobs(self, kinds):
-        """Run one or more update passes ('video', 'audio') in the background.
-        Call from the Tk thread. Returns False if this playlist is already busy."""
         if not self._try_acquire():
             return False
         self._lock_buttons()
@@ -607,9 +535,8 @@ class PlaylistCard(ttk.Frame):
             msg += f" {left_alone} no longer in the playlist (left alone)."
         return msg
 
-    # ------------------------------------------------------------------
-    # Redownload a single item by playlist position
-    # ------------------------------------------------------------------
+    # -- redownload one item -----------------------------------------------
+
     def start_redownload(self):
         if self.busy:
             return
@@ -629,14 +556,10 @@ class PlaylistCard(ttk.Frame):
         archive_file = self.archive_path("video")
         audio_archive_file = self.archive_path("audio")
         self.current_kind = "video"
-
         try:
             probe_opts = {
-                "quiet": True,
-                "no_warnings": True,
-                "extract_flat": True,
-                "skip_download": True,
-                "playlist_items": str(idx),
+                "quiet": True, "no_warnings": True, "extract_flat": True,
+                "skip_download": True, "playlist_items": str(idx),
             }
             with yt_dlp.YoutubeDL(probe_opts) as probe:
                 info = probe.extract_info(self.data["url"], download=False)
@@ -647,8 +570,6 @@ class PlaylistCard(ttk.Frame):
             vid_id = entries[0].get("id")
             vid_title = entries[0].get("title", "")
 
-            # Clear it from both archives so this forces a real redownload
-            # regardless of whether you'd grabbed it as video, audio, or both.
             drop_from_archive(archive_file, [vid_id])
             drop_from_archive(audio_archive_file, [vid_id])
 
@@ -682,9 +603,10 @@ class PlaylistCard(ttk.Frame):
             self.busy = False
 
 
-# ----------------------------------------------------------------------
-# Phone / LAN page
-# ----------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Phone / LAN page (includes folder-sync via File System Access API)
+# ---------------------------------------------------------------------------
+
 PAGE_HTML = r"""<!doctype html>
 <html lang="en">
 <head>
@@ -726,8 +648,9 @@ h3{font-size:.95rem;margin:14px 0 2px;color:var(--muted);font-weight:600}
 .links{display:flex;gap:18px}
 a{color:var(--accent);font-weight:600;text-decoration:none;padding:6px 0}
 a:focus-visible,button:focus-visible,select:focus-visible,summary:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
-#toast{position:fixed;left:50%;bottom:20px;transform:translate(-50%,16px);max-width:90vw;background:var(--ink);color:var(--bg);padding:10px 16px;border-radius:10px;opacity:0;pointer-events:none;transition:opacity .2s,transform .2s}
+#toast{position:fixed;left:50%;bottom:20px;transform:translate(-50%,16px);max-width:90vw;background:var(--ink);color:var(--bg);padding:10px 16px;border-radius:10px;opacity:0;pointer-events:none;transition:opacity .2s,transform .2s;z-index:10}
 #toast.show{opacity:1;transform:translate(-50%,0)}
+.hint{font-size:.85rem;color:var(--muted);margin:6px 0 0}
 @media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
 </style>
 </head>
@@ -772,11 +695,11 @@ function toast(msg) {
   toastEl.textContent = msg;
   toastEl.classList.add("show");
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => toastEl.classList.remove("show"), 3200);
+  toastTimer = setTimeout(() => toastEl.classList.remove("show"), 3600);
 }
 
 function makeCard(p) {
-  const c = { title: p.title, wasBusy: false, counts: "" };
+  const c = { title: p.title, wasBusy: false, counts: "", syncing: false };
   c.name = h("h2", {}, p.title);
   c.fill = h("div", { class: "fill" });
   c.bar = h("div", { class: "bar" }, c.fill);
@@ -784,16 +707,18 @@ function makeCard(p) {
   c.status = h("p", { class: "status" });
   c.btnVideo = h("button", { onclick: () => update(c, "video") }, "Update videos");
   c.btnAudio = h("button", { class: "quiet", onclick: () => update(c, "audio") }, "Update audio");
+  c.btnSync = h("button", { class: "quiet", onclick: () => syncFolder(c) }, "Sync");
   c.auto = h("select", { "aria-label": "Auto-update", onchange: () => setAuto(c) },
     AUTO.map(([m, label]) => h("option", { value: m }, label)));
   c.list = h("div", {});
   c.files = h("details", { ontoggle: () => { if (c.files.open) loadFiles(c); } },
     h("summary", {}, "Files"), c.list);
+  c.hint = h("p", { class: "hint" }, "Sync: enter a range (e.g. 1-10) → downloads it as one zip.");
   c.root = h("section", { class: "playlist" },
     c.name, c.bar, c.meta, c.status,
-    h("div", { class: "actions" }, c.btnVideo, c.btnAudio),
+    h("div", { class: "actions" }, c.btnVideo, c.btnAudio, c.btnSync),
     h("label", { class: "auto" }, "Auto-update", c.auto),
-    c.files);
+    c.hint, c.files);
   return c;
 }
 
@@ -802,7 +727,9 @@ function paint(c, p) {
   c.bar.classList.toggle("wait", p.busy && p.progress < 1);
   c.meta.textContent = p.videos + (p.videos === 1 ? " video, " : " videos, ") + p.audios + " audio";
   c.status.textContent = p.status;
-  c.btnVideo.disabled = c.btnAudio.disabled = p.busy;
+  const busy = p.busy || c.syncing;
+  c.btnVideo.disabled = c.btnAudio.disabled = busy;
+  c.btnSync.disabled = p.busy;
   if (document.activeElement !== c.auto) c.auto.value = String(p.auto_minutes || 0);
   const counts = p.videos + "/" + p.audios;
   if (c.files.open && ((c.wasBusy && !p.busy) || counts !== c.counts)) loadFiles(c);
@@ -838,7 +765,8 @@ async function loadFiles(c) {
 
 function group(c, label, kind, files) {
   const box = h("div", {}, h("h3", {}, label));
-  if (!files.length) box.append(h("p", { class: "none" }, kind === "video" ? "No videos downloaded yet." : "No audio downloaded yet."));
+  if (!files.length) box.append(h("p", { class: "none" },
+    kind === "video" ? "No videos downloaded yet." : "No audio downloaded yet."));
   for (const f of files) {
     const base = "/files/" + enc(c.title) + "/" + kind + "/" + enc(f.name);
     box.append(h("div", { class: "file" },
@@ -873,6 +801,31 @@ async function setAuto(c) {
   }
 }
 
+/* ---------- Sync: range -> one zip ---------- */
+async function syncFolder(c) {
+  const ans = prompt("Range to download as a zip (e.g. 1-10 or 5):", "1-10");
+  if (!ans) return;
+  const m = ans.trim().match(/^(\d+)\s*(?:-\s*(\d+))?$/);
+  if (!m) { toast("Use a range like 1-10."); return; }
+  const from = Math.min(+m[1], +(m[2] || m[1])), to = Math.max(+m[1], +(m[2] || m[1]));
+  try {
+    const r = await fetch("/api/files?playlist=" + enc(c.title), { cache: "no-store" });
+    const j = await r.json();
+    const n = [...(j.video || []), ...(j.audio || [])].filter(f => {
+      const k = parseInt(f.name, 10);
+      return k >= from && k <= to;
+    }).length;
+    if (!n) { toast("No files in that range."); return; }
+    const a = h("a", { href: "/api/zip?playlist=" + enc(c.title) + "&from=" + from + "&to=" + to });
+    document.body.append(a);
+    a.click();
+    a.remove();
+    toast("Zipping " + n + " file" + (n === 1 ? "" : "s") + "…");
+  } catch (e) {
+    toast("Can't reach your PC.");
+  }
+}
+
 async function refresh() {
   clearTimeout(timer);
   let delay = 6000;
@@ -897,24 +850,11 @@ refresh();
 """
 
 
-def get_lan_ip():
-    """This PC's address on the local network, or None if it has no route out (offline).
-    (A UDP 'connect' only picks a route; no packet is actually sent.)"""
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.settimeout(1)
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-    except OSError:
-        return None
-    finally:
-        s.close()
-    return None if not ip or ip.startswith("127.") or ip == "0.0.0.0" else ip
-
+# ---------------------------------------------------------------------------
+# HTTP server
+# ---------------------------------------------------------------------------
 
 class LanServer(http.server.ThreadingHTTPServer):
-    # Off on purpose: on Windows this flag would let us "bind" a port that another
-    # program already owns, which defeats the whole check-for-a-free-port step.
     allow_reuse_address = False
     daemon_threads = True
 
@@ -925,9 +865,8 @@ def make_handler(app):
         server_version = "PlaylistScraper"
 
         def log_message(self, fmt, *args):
-            pass  # keep the console quiet
+            pass
 
-        # -- small response helpers ------------------------------------
         def _send(self, code, body, ctype):
             self.send_response(code)
             self.send_header("Content-Type", ctype)
@@ -939,7 +878,6 @@ def make_handler(app):
         def _json(self, obj, code=200):
             self._send(code, json.dumps(obj).encode("utf-8"), "application/json; charset=utf-8")
 
-        # -- routes ----------------------------------------------------
         def do_GET(self):
             u = urllib.parse.urlparse(self.path)
             q = urllib.parse.parse_qs(u.query)
@@ -954,6 +892,8 @@ def make_handler(app):
                         self._json({"error": "Unknown playlist."}, 404)
                     else:
                         self._json(card.list_files())
+                elif u.path == "/api/zip":
+                    self._serve_zip(q)
                 elif u.path.startswith("/files/"):
                     self._serve_file(u.path, q)
                 else:
@@ -996,7 +936,43 @@ def make_handler(app):
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                 pass
 
-        # -- file download / streaming (with Range so phones can seek) --
+        def _serve_zip(self, q):
+            card = app.find_card(q.get("playlist", [""])[0])
+            try:
+                lo, hi = int(q.get("from", ["0"])[0]), int(q.get("to", ["0"])[0])
+            except ValueError:
+                return self._json({"error": "Bad range."}, 400)
+            if card is None:
+                return self._json({"error": "Unknown playlist."}, 404)
+            picked = []
+            for kind, exts in (("video", VIDEO_EXTS), ("audio", AUDIO_EXTS)):
+                folder = card.kind_folder(kind)
+                for f in scan_media(folder, exts, with_size=False):
+                    m = re.match(r"\d+", f["name"])
+                    if m and lo <= int(m.group()) <= hi:
+                        picked.append((os.path.join(folder, f["name"]), kind + "/" + f["name"]))
+            if not picked:
+                return self._json({"error": "No files in that range."}, 404)
+            with tempfile.TemporaryFile(dir=BASE_DIR) as tmp:
+                with zipfile.ZipFile(tmp, "w", zipfile.ZIP_STORED, allowZip64=True) as z:
+                    for full, arc in picked:
+                        z.write(full, arc)
+                size = tmp.tell()
+                tmp.seek(0)
+                zname = f"{card.data['title']} {lo}-{hi}.zip"
+                ascii_name = zname.encode("ascii", "replace").decode("ascii").replace('"', "'")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/zip")
+                self.send_header("Content-Length", str(size))
+                self.send_header("Content-Disposition",
+                                 f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{urllib.parse.quote(zname)}")
+                self.end_headers()
+                while True:
+                    chunk = tmp.read(1 << 20)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+
         def _serve_file(self, path, q):
             parts = path[len("/files/"):].split("/")
             if len(parts) != 3:
@@ -1060,9 +1036,6 @@ def make_handler(app):
 
 
 class ServerManager:
-    """Starts the web server while the PC is online and shuts it down when
-    the network goes away. Prefers the last saved port so the phone link
-    stays stable across restarts; falls back to a new random free port."""
     CHECK_MS = 10000
 
     def __init__(self, app):
@@ -1081,7 +1054,7 @@ class ServerManager:
             if ip and self.httpd is None:
                 self._start(ip)
             elif ip and ip != self.ip:
-                self.ip = ip  # Wi-Fi changed; same server, new address
+                self.ip = ip
                 self.app.set_server_status(self.url)
             elif not ip and self.httpd is not None:
                 self.stop()
@@ -1092,9 +1065,6 @@ class ServerManager:
     def _start(self, ip):
         handler = make_handler(self.app)
         httpd = None
-        port = None
-
-        # Prefer the last port we used so the phone bookmark keeps working.
         preferred = load_saved_port()
         candidates = []
         if preferred is not None:
@@ -1106,7 +1076,7 @@ class ServerManager:
 
         for port in candidates:
             try:
-                httpd = LanServer(("0.0.0.0", port), handler)  # fails if the port is taken
+                httpd = LanServer(("0.0.0.0", port), handler)
                 break
             except OSError:
                 httpd = None
@@ -1130,6 +1100,10 @@ class ServerManager:
         self.httpd = self.ip = self.port = None
 
 
+# ---------------------------------------------------------------------------
+# Main app
+# ---------------------------------------------------------------------------
+
 class App:
     def __init__(self, root):
         self.root = root
@@ -1140,7 +1114,6 @@ class App:
         top.pack(fill="x")
 
         ttk.Label(top, text="Paste a YouTube playlist link:").pack(anchor="w")
-
         entry_row = ttk.Frame(top)
         entry_row.pack(fill="x", pady=(4, 0))
         self.url_entry = ttk.Entry(entry_row)
@@ -1151,7 +1124,6 @@ class App:
         self.add_status = ttk.Label(top, text="", foreground="#555")
         self.add_status.pack(anchor="w", pady=(4, 0))
 
-        # --- Phone / LAN access ---
         srv_row = ttk.Frame(top)
         srv_row.pack(fill="x", pady=(6, 0))
         self.server_url = None
@@ -1160,39 +1132,32 @@ class App:
         self.copy_btn = ttk.Button(srv_row, text="Copy link", command=self.copy_link, state="disabled")
         self.copy_btn.pack(side="right")
 
-        # --- Subtitle Downloader (standalone, works on any YT link) ---
+        # Subtitle downloader
         sub_frame = ttk.LabelFrame(root, text="Subtitle Downloader (YouTube)", padding=10)
         sub_frame.pack(fill="x", padx=10, pady=(0, 10))
-
         sub_row = ttk.Frame(sub_frame)
         sub_row.pack(fill="x")
         ttk.Label(sub_row, text="Video or playlist link:").pack(side="left")
         self.sub_url_entry = ttk.Entry(sub_row)
         self.sub_url_entry.pack(side="left", fill="x", expand=True, padx=(6, 6))
-
         ttk.Label(sub_row, text="Lang:").pack(side="left")
         self.sub_lang_entry = ttk.Entry(sub_row, width=6)
         self.sub_lang_entry.insert(0, "en")
         self.sub_lang_entry.pack(side="left", padx=(4, 6))
-
         self.sub_btn = ttk.Button(sub_row, text="Download Subtitles", command=self.start_subtitle_download)
         self.sub_btn.pack(side="left")
-
         self.sub_status = ttk.Label(sub_frame, text="", foreground="#555", wraplength=540, justify="left")
         self.sub_status.pack(fill="x", pady=(6, 0))
 
-        # scrollable list of playlist cards
+        # scrollable cards
         container = ttk.Frame(root)
         container.pack(fill="both", expand=True, padx=10, pady=10)
-
         canvas = tk.Canvas(container, highlightthickness=0)
         scrollbar = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
         self.list_frame = ttk.Frame(canvas)
-
         self.list_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
         canvas.create_window((0, 0), window=self.list_frame, anchor="nw", width=540)
         canvas.configure(yscrollcommand=scrollbar.set)
-
         canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
 
@@ -1205,9 +1170,6 @@ class App:
         root.after(30000, self._auto_tick)
         root.protocol("WM_DELETE_WINDOW", self.on_close)
 
-    # ------------------------------------------------------------------
-    # Server / phone access
-    # ------------------------------------------------------------------
     def set_server_status(self, url, error=None):
         self.server_url = url
         if url:
@@ -1241,7 +1203,7 @@ class App:
             if card.data.get("auto_minutes") and not card.busy and now >= card.next_auto:
                 kinds = ["video"]
                 if os.path.exists(card.archive_path("audio")):
-                    kinds.append("audio")  # you've used Audio Only here before, so keep it fresh too
+                    kinds.append("audio")
                 card.start_jobs(kinds)
         self.root.after(30000, self._auto_tick)
 
@@ -1251,9 +1213,6 @@ class App:
         finally:
             self.root.destroy()
 
-    # ------------------------------------------------------------------
-    # Playlists
-    # ------------------------------------------------------------------
     def add_playlist(self):
         url = self.url_entry.get().strip()
         if not url:
@@ -1261,7 +1220,6 @@ class App:
         if any(c.data["url"] == url for c in self.cards):
             self.add_status.config(text="That playlist is already in your list.")
             return
-
         self.add_status.config(text="Fetching playlist info…")
         self.url_entry.config(state="disabled")
         threading.Thread(target=self._fetch_and_add, args=(url,), daemon=True).start()
@@ -1274,7 +1232,6 @@ class App:
         except Exception as e:
             self.root.after(0, lambda: self._add_failed(str(e)))
             return
-
         folder = os.path.join(BASE_DIR, title)
         os.makedirs(folder, exist_ok=True)
         data = {"url": url, "title": title, "folder": folder}
@@ -1290,7 +1247,6 @@ class App:
         self.add_status.config(text=f'Added "{data["title"]}"')
         self.url_entry.delete(0, "end")
         self.url_entry.config(state="normal")
-        # kick off first download automatically
         self.cards[-1].start_jobs(["video"])
 
     def add_card(self, data):
@@ -1306,9 +1262,6 @@ class App:
     def persist(self):
         save_config([c.data for c in self.cards])
 
-    # ------------------------------------------------------------------
-    # Subtitle downloader
-    # ------------------------------------------------------------------
     def start_subtitle_download(self):
         url = self.sub_url_entry.get().strip()
         lang = self.sub_lang_entry.get().strip() or "en"
