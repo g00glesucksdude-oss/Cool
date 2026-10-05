@@ -26,7 +26,7 @@ PART_MINUTES = 60          # length of each part
 
 TRANSCRIBE = True          # send each part to Gemini
 GEMINI_API_KEY = ""        # paste key here, or env GEMINI_API_KEY, or a gemini_key.txt next to this script
-GEMINI_MODELS = ["gemini-3.5-flash", "gemini-2.5-flash"]  # tried in order if a name isn't found
+GEMINI_MODELS = ["gemini-3.5-flash"]  # tried in order if a name isn't found
 TRANSCRIBE_PROMPT = ("Transcribe this audio word for word. If there is more than one "
                      "speaker, label them (Speaker 1, Speaker 2). "
                      "Output only the transcript, no commentary.")
