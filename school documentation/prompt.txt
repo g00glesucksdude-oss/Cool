@@ -1,0 +1,10 @@
+Role: You are an expert educational content analyst and curriculum specialist.
+Task: Analyze the provided classroom video transcript and extract strictly the lesson-focused and academic content, completely filtering out classroom management, prayer routines, seating arrangements, attendance checking, and administrative chatter.
+Instructions:
+Topic & Context: State the specific subject topic, subtopics, and learning objectives explicitly mentioned by the teacher.
+Assigned Tasks & Materials: List all instructional materials, videos, and assigned problem sets/tasks mentioned (including item counts, formats, and deadlines).
+Pedagogical Workflow: Outline the step-by-step instructional sequence for the lesson (e.g., self-directed viewing $\rightarrow$ practice problem solving $\rightarrow$ peer checking/review).
+Key Mathematical/Academic Terms: Extract every specific academic or mathematical term referenced in the transcript.
+Output Format:
+Present the extracted information clearly using bold headings and bullet points. Do not include any timestamps or non-academic narrative details.
+languages range from hiligaynon english and tagalog
