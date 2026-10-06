@@ -37,6 +37,9 @@ OVERVIEW_BINS = 4000
 ZOOM_BINS = 1400
 CHUNK = 1 << 20
 ZOOMS = {"5 s": 5, "30 s": 30, "2 min": 120, "10 min": 600, "1 hour": 3600}
+VIS_MODES = ["Animated visualizer", "Image / GIF only (fast)"]
+STATIC_FPS = 2                         # frame rate for a still-image video (tiny + fast)
+GIF_FPS = 15
 RESOLUTIONS = ["1280x720", "1920x1080", "854x480"]
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
@@ -307,31 +310,56 @@ class App:
         self.out_lbl = ttk.Label(ex, text="(not set)")
         self.out_lbl.pack(side="left", padx=8)
 
-        ex2 = ttk.Frame(bottom)
-        ex2.pack(fill="x", **pad)
         self.aprefix = tk.StringVar(value="log")
         self.vprefix = tk.StringVar(value="visualizer")
         self.q_var = tk.StringVar(value="10")
         self.res_var = tk.StringVar(value=RESOLUTIONS[0])
-        self.btn_audio = ttk.Button(ex2, text="Export Audio (.ogg)", command=lambda: self.export("audio"))
+        self.apart_var = tk.StringVar(value=str(AUDIO_PART_SECONDS // 60))
+        self.vpart_var = tk.StringVar(value=str(VIDEO_PART_SECONDS // 60))
+        self.vmode_var = tk.StringVar(value=VIS_MODES[0])
+
+        exa = ttk.Frame(bottom)                   # ---- audio row
+        exa.pack(fill="x", **pad)
+        self.btn_audio = ttk.Button(exa, text="Export Queue (.ogg)", command=lambda: self.export("audio"))
         self.btn_audio.pack(side="left")
-        ttk.Label(ex2, text="prefix").pack(side="left", padx=(6, 2))
-        ttk.Entry(ex2, textvariable=self.aprefix, width=10).pack(side="left")
-        ttk.Label(ex2, text="Vorbis quality").pack(side="left", padx=(8, 2))
-        ttk.Spinbox(ex2, from_=0, to=10, width=4, textvariable=self.q_var).pack(side="left")
-        self.btn_video = ttk.Button(ex2, text="Export Video Visualizer (.mp4)", command=lambda: self.export("video"))
-        self.btn_video.pack(side="left", padx=(24, 0))
-        ttk.Label(ex2, text="prefix").pack(side="left", padx=(6, 2))
-        ttk.Entry(ex2, textvariable=self.vprefix, width=12).pack(side="left")
-        cmb_res = ttk.Combobox(ex2, textvariable=self.res_var, values=RESOLUTIONS, state="readonly", width=10)
+        self.btn_audio_all = ttk.Button(exa, text="Export ENTIRE Audio (.ogg)",
+                                        command=lambda: self.export("audio", whole=True))
+        self.btn_audio_all.pack(side="left", padx=(4, 0))
+        ttk.Label(exa, text="prefix").pack(side="left", padx=(8, 2))
+        ttk.Entry(exa, textvariable=self.aprefix, width=10).pack(side="left")
+        ttk.Label(exa, text="Vorbis quality").pack(side="left", padx=(8, 2))
+        ttk.Spinbox(exa, from_=0, to=10, width=4, textvariable=self.q_var).pack(side="left")
+        ttk.Label(exa, text="Part length (min, 0 = one file)").pack(side="left", padx=(8, 2))
+        ttk.Entry(exa, textvariable=self.apart_var, width=6).pack(side="left")
+
+        exv = ttk.Frame(bottom)                   # ---- video row
+        exv.pack(fill="x", **pad)
+        self.btn_video = ttk.Button(exv, text="Export Queue (.mp4)", command=lambda: self.export("video"))
+        self.btn_video.pack(side="left")
+        self.btn_video_all = ttk.Button(exv, text="Export ENTIRE Video (.mp4)",
+                                        command=lambda: self.export("video", whole=True))
+        self.btn_video_all.pack(side="left", padx=(4, 0))
+        ttk.Label(exv, text="prefix").pack(side="left", padx=(8, 2))
+        ttk.Entry(exv, textvariable=self.vprefix, width=10).pack(side="left")
+        ttk.Label(exv, text="Part (min)").pack(side="left", padx=(8, 2))
+        ttk.Entry(exv, textvariable=self.vpart_var, width=6).pack(side="left")
+        cmb_res = ttk.Combobox(exv, textvariable=self.res_var, values=RESOLUTIONS, state="readonly", width=10)
         cmb_res.pack(side="left", padx=6)
-        for cb in (self.cmb_sort, cz, cmb_res):
+
+        exb = ttk.Frame(bottom)                   # ---- video look row
+        exb.pack(fill="x", **pad)
+        ttk.Label(exb, text="Video look:").pack(side="left")
+        cmb_mode = ttk.Combobox(exb, textvariable=self.vmode_var, values=VIS_MODES, state="readonly", width=24)
+        cmb_mode.pack(side="left", padx=6)
+        for cb in (self.cmb_sort, cz, cmb_res, cmb_mode):
             cb.bind("<<ComboboxSelected>>", lambda e: self.root.focus_set(), add="+")
-        ttk.Button(ex2, text="Background…", command=self.choose_bg).pack(side="left")
-        ttk.Button(ex2, text="Clear", width=6, command=self.clear_bg).pack(side="left", padx=2)
-        self.bg_lbl = ttk.Label(ex2, text="black")
+        ttk.Button(exb, text="Image / GIF…", command=self.choose_bg).pack(side="left")
+        ttk.Button(exb, text="Clear", width=6, command=self.clear_bg).pack(side="left", padx=2)
+        self.bg_lbl = ttk.Label(exb, text="black")
         self.bg_lbl.pack(side="left", padx=4)
-        self.export_widgets = [self.btn_audio, self.btn_video]
+        self.export_widgets = [self.btn_audio, self.btn_audio_all, self.btn_video, self.btn_video_all]
+        for v in (self.apart_var, self.vpart_var):
+            v.trace_add("write", lambda *a: self._update_queue_label())
 
         self.progress = ttk.Progressbar(bottom, maximum=1000)
         self.progress.pack(fill="x", **pad)
@@ -880,19 +908,31 @@ class App:
 
     def _refresh_segments(self):
         self.seg_tv.delete(*self.seg_tv.get_children())
-        total = 0
         for i, (a, b) in enumerate(self.segments, 1):
-            total += b - a
             self.seg_tv.insert("", "end", values=(
                 i, fmt_time(a / self.rate), fmt_time(b / self.rate), fmt_time((b - a) / self.rate)))
+        self._update_queue_label()
+
+    def _part_seconds(self, kind):
+        """Part length in seconds from the text box; 0 means 'one single file'."""
+        var, default = ((self.apart_var, AUDIO_PART_SECONDS) if kind == "audio"
+                        else (self.vpart_var, VIDEO_PART_SECONDS))
+        try:
+            m = float(var.get())
+        except ValueError:
+            return default
+        return max(1.0, m * 60.0) if m > 0 else 0.0
+
+    def _update_queue_label(self):
         if not self.segments:
             self.queue_lbl.configure(text="Queue empty")
             return
-        secs = total / self.rate
+        secs = sum(b - a for a, b in self.segments) / self.rate
+        pa, pv = self._part_seconds("audio"), self._part_seconds("video")
         self.queue_lbl.configure(text=(
             f"{len(self.segments)} segment(s), total {fmt_time(secs)}  →  "
-            f"{math.ceil(secs / AUDIO_PART_SECONDS)} audio part(s), "
-            f"{math.ceil(secs / VIDEO_PART_SECONDS)} video part(s)"))
+            f"{math.ceil(secs / pa) if pa else 1} audio part(s), "
+            f"{math.ceil(secs / pv) if pv else 1} video part(s)"))
 
     # --------------------------------------------------------------- export
     def choose_outdir(self):
@@ -902,8 +942,8 @@ class App:
             self.out_lbl.configure(text=d)
 
     def choose_bg(self):
-        p = filedialog.askopenfilename(title="Background image",
-                                       filetypes=[("Images", "*.png *.jpg *.jpeg *.bmp *.webp"), ("All", "*.*")])
+        p = filedialog.askopenfilename(title="Background image or GIF",
+                                       filetypes=[("Images / GIF", "*.png *.jpg *.jpeg *.bmp *.webp *.gif"), ("All", "*.*")])
         if p:
             self.bg_path = p
             self.bg_lbl.configure(text=os.path.basename(p))
@@ -919,9 +959,20 @@ class App:
             self._encoders = r.stdout.decode(errors="replace")
         return name in self._encoders
 
-    def export(self, kind):
-        if not self.segments:
-            messagebox.showinfo("Export", "Add at least one segment to the queue first.")
+    def export(self, kind, whole=False):
+        if whole:
+            if not self.master_ready:
+                return
+            segs = [(0, self.total_frames)]          # everything, merged, ignoring the queue
+        else:
+            segs = list(self.segments)
+            if not segs:
+                messagebox.showinfo("Export", "Add at least one segment to the queue first "
+                                              "(or use the 'ENTIRE' button).")
+                return
+        fast = kind == "video" and self.vmode_var.get() == VIS_MODES[1]
+        if fast and not self.bg_path:
+            messagebox.showinfo("Export", "'Image / GIF only' needs a picture: click 'Image / GIF…' first.")
             return
         if not self.out_dir:
             self.choose_outdir()
@@ -935,11 +986,12 @@ class App:
             kind=kind, out_dir=self.out_dir, quality=quality,
             prefix=(self.aprefix.get() if kind == "audio" else self.vprefix.get()).strip()
             or ("log" if kind == "audio" else "visualizer"),
-            res=self.res_var.get(), bg=self.bg_path)
+            res=self.res_var.get(), bg=self.bg_path, fast=fast,
+            part_sec=self._part_seconds(kind))
         self.cancel_evt.clear()
         self.busy = True
         self.refresh_buttons()
-        threading.Thread(target=self._export_worker, args=(list(self.segments), opts), daemon=True).start()
+        threading.Thread(target=self._export_worker, args=(segs, opts), daemon=True).start()
 
     def _build_cmd(self, opts, out):
         rate, ch = self.rate, self.ch
@@ -948,8 +1000,21 @@ class App:
         if opts["kind"] == "audio":
             return base + ["-c:a", "libvorbis", "-q:a", str(opts["quality"]), out]
         W, H = opts["res"].split("x")
+        if opts.get("fast"):
+            is_gif = opts["bg"].lower().endswith(".gif")
+            fps = GIF_FPS if is_gif else STATIC_FPS
+            src = (["-stream_loop", "-1", "-i", opts["bg"]] if is_gif
+                   else ["-loop", "1", "-framerate", str(fps), "-i", opts["bg"]])
+            fc = (f"[1:v]scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},"
+                  f"setsar=1,fps={fps},format=yuv420p[v]")
+            return base + src + ["-filter_complex", fc, "-map", "[v]", "-map", "0:a",
+                                 "-c:v", "libx264", "-preset", "ultrafast", "-crf", "26", "-r", str(fps)]  \
+                + ([] if is_gif else ["-tune", "stillimage"]) \
+                + ["-c:a", "aac", "-b:a", "192k", "-shortest", "-movflags", "+faststart", out]
         colors = "|".join(WAVE_COLORS[i % len(WAVE_COLORS)] for i in range(ch))
-        if opts["bg"]:
+        if opts["bg"] and opts["bg"].lower().endswith(".gif"):
+            bg_in = ["-stream_loop", "-1", "-i", opts["bg"]]          # animated GIF under the waveform
+        elif opts["bg"]:
             bg_in = ["-loop", "1", "-framerate", str(FPS), "-i", opts["bg"]]
         else:
             bg_in = ["-f", "lavfi", "-i", f"color=c=black:s={W}x{H}:r={FPS}"]
@@ -968,14 +1033,17 @@ class App:
             if not self._has_encoder(need):
                 raise RuntimeError(f"This ffmpeg build has no {need} encoder.")
             fb = 2 * self.ch
-            part_sec = AUDIO_PART_SECONDS if kind == "audio" else VIDEO_PART_SECONDS
-            parts = split_parts(segs, part_sec * self.rate)
+            total_f = sum(b - a for a, b in segs)
+            part_sec = opts["part_sec"]
+            part_frames = max(1, int(part_sec * self.rate)) if part_sec > 0 else total_f
+            parts = split_parts(segs, part_frames)
             grand = sum(b - a for p in parts for a, b in p)
             done = 0
             self.log(f"Export {kind}: {fmt_time(grand / self.rate)} in {len(parts)} part(s)")
             with open(self.master_path, "rb") as src:
                 for pi, ranges in enumerate(parts, 1):
-                    out = os.path.join(opts["out_dir"], f"{opts['prefix']}_part{pi}.{ext}")
+                    name = f"{opts['prefix']}.{ext}" if len(parts) == 1 else f"{opts['prefix']}_part{pi}.{ext}"
+                    out = os.path.join(opts["out_dir"], name)
                     self.log(f"Part {pi}/{len(parts)} → {out}")
                     proc = subprocess.Popen(self._build_cmd(opts, out), stdin=subprocess.PIPE,
                                             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
