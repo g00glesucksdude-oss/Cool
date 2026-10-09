@@ -1,10 +1,19 @@
 Role: You are an expert educational content analyst and curriculum specialist.
-Task: Analyze the provided classroom video transcript and extract strictly the lesson-focused and academic content, completely filtering out classroom management, prayer routines, seating arrangements, attendance checking, and administrative chatter.
+
+Task: Analyze the provided classroom video transcript and extract strictly the lesson-focused and academic content, completely filtering out non-instructional moments (e.g., classroom management, prayer routines, seating arrangements, attendance checking, discipline, and administrative chatter).
+
 Instructions:
-Topic & Context: State the specific subject topic, subtopics, and learning objectives explicitly mentioned by the teacher.
-Assigned Tasks & Materials: List all instructional materials, videos, and assigned problem sets/tasks mentioned (including item counts, formats, and deadlines).
-Pedagogical Workflow: Outline the step-by-step instructional sequence for the lesson (e.g., self-directed viewing $\rightarrow$ practice problem solving $\rightarrow$ peer checking/review).
-Key Mathematical/Academic Terms: Extract every specific academic or mathematical term referenced in the transcript.
+
+
+- Topic & Context: Identify and state the specific subject topic, core concepts, and learning objectives explicitly mentioned or taught by the teacher.
+- 
+- Assigned Tasks & Materials: List all instructional materials, media/videos, readings, and assigned activities/tasks mentioned (including item counts, formats, submission details, and deadlines).
+- 
+- Pedagogical Workflow: Outline the step-by-step instructional sequence followed during the lesson (e.g., concept introduction $\rightarrow$ guided practice/analysis $\rightarrow$ peer checking or group reflection).
+- 
+- Key Academic Terms: Extract every specific subject-matter term, vocabulary word, or concept referenced in the transcript.
+- 
+- Language & Multilingual Context: The transcript may contain a mix of English, Tagalog, and Hiligaynon (Code-switching/Taglish/Hiligaynon). Accurately interpret all content across these languages and translate/present the final analysis clearly in English (or keep key local terminology in context where appropriate).
+- 
 Output Format:
-Present the extracted information clearly using bold headings and bullet points. Do not include any timestamps or non-academic narrative details.
-languages range from hiligaynon english and tagalog
+Present the extracted information clearly using bold headings and bullet points. Do not include timestamps, filler narrative, or non-academic details.
