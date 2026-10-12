@@ -1,109 +1,86 @@
-Here are your study notes for the **Science** section based on the provided material:
+---
+
+## **1. Modern Biotech & GMOs**
+
+### **Core Definitions**
+
+* **Modern Biotechnology:** Using DNA, cells, or microbes to change an organism's traits.
+* **GMO (Genetically Modified Organism):** An organism whose DNA was altered in a lab to add or boost traits (e.g., higher nutrition, pest resistance).
 
 ---
 
-## **Modern Biotechnology & Genetic Engineering**
+## **2. Lab Techniques**
 
-### **Core Definition**
+### **DNA Fingerprinting**
 
-* **Modern Biotechnology:** The manipulation of genetic material (DNA, genes, cells, and microorganisms) using advanced techniques to alter an organism's traits, commonly referred to as genetic engineering.
+* **Purpose:** Identifies individuals using unique DNA patterns.
+* **Key Mechanism:** Uses **polymorphic markers** (unique regions in DNA).
+* **Sample Types:** Blood, saliva, urine, hair follicles, semen.
 
+### **PCR (Polymerase Chain Reaction)**
 
-
-### **Key Techniques & Processes**
-
-* **DNA Fingerprinting:**
-* Used to identify individuals based on their unique DNA sequences.
-
-
-* While organisms of the same species share similar general sequences, individual uniqueness is determined by **polymorphic markers**.
-
-
-* Common biological samples collected for testing include blood, saliva, urine, hair follicles, and semen.
-
-
-
-
-* **Polymerase Chain Reaction (PCR):** Also known as **molecular photocopying**, a laboratory technique used to generate millions or billions of copies of a specific DNA segment.
-
-
-* **Gene Therapy:** A treatment method for genetic diseases designed to avoid major medical procedures or surgery by inserting genetic material into a patient's cells.
-
-
-* **In Vivo Gene Therapy:** Genetic material is packaged and injected *directly* into the patient's body without removing cells.
-
-
-* **Ex Vivo Gene Therapy:** Cells are removed from the patient's body, altered in a laboratory setting, and then returned.
-
-
-
-
-
-### **Reproductive Technologies**
-
-* **In Vitro Fertilization (IVF):** A technique where an egg cell and a sperm cell are fertilized outside the body in a controlled laboratory Petri dish.
-
-
-* The fertilized egg becomes a **zygote**, which develops into an **embryo**.
-
-
-* The embryo is subsequently transferred and implanted into the female's uterus.
-
-
-
-
-* **Intracytoplasmic Sperm Injection (ICSI):** A specialized form of IVF where a single sperm cell is injected directly into an egg cell.
-
-Here are your comprehensive study notes for the **Science** section, incorporating the additional core concepts and academic terms provided:
+* **Nickname:** **"Molecular Photocopying"**
+* **Function:** Rapidly creates millions/billions of copies of a DNA segment.
 
 ---
 
-## **Modern Biotechnology & Genetic Engineering**
+## **3. Gene Therapy**
 
-### **Primary Concepts & Goals**
+> **Concept:** Fixes faulty genes to treat diseases without major surgery.
 
-* **Modern Biotechnology Goals:** The direct manipulation and alteration of genetic material (DNA, cells, organisms) in a laboratory setting to solve biological problems (such as diseases caused by viruses or bacteria) and produce desired traits.
-* **Genetically Modified Organisms (GMOs / GMO Products):** Organisms whose DNA has been altered in a laboratory using genetic engineering techniques to enhance existing traits or introduce new ones (e.g., increased nutritional value, pest resistance, herbicide tolerance).
+* **In Vivo:** Gene injected **directly inside** the body.
+* **Ex Vivo:** Cells removed $\rightarrow$ modified in lab $\rightarrow$ **returned** to body.
+* **Target Conditions:**
+* **Hemophilia:** Blood can't clot properly.
+* **Cystic Fibrosis:** Mucus buildup damages lungs/breathing.
+* **Sickle Cell Anemia:** Misshapen (sickle) red blood cells block blood flow.
 
-### **Local GMO Crops in the Philippines**
 
-* In 2003, the Philippines became the first country in its region to commercialize and cultivate biotech crops, modifying key staples including corn, eggplant, cotton, and rice.
-* **Cry1Ac Gene:** A gene derived from the soil bacterium *Bacillus thuringiensis* (Bt) that is inserted into plants to enable toxin production, effectively deterring specific destructive pests.
-* **Bt Crops:** Bt corn, Bt eggplant, and Bt cotton are genetically modified to protect against pests like the corn borer and the eggplant fruit and shoot borer (EFSB), thereby safeguarding crop quality and yield.
-* **Golden Rice (Malusog Rice):** Genetically enhanced rice containing inserted genes from corn and bacteria to synthesize beta-carotene (a precursor to Vitamin A). Its main objectives are to:
-1. Combat Vitamin A deficiency.
-2. Reduce childhood mortality.
+
+---
+
+## **4. Reproductive Tech**
+
+* **IVF (In Vitro Fertilization):**
+1. Sperm + Egg fertilized in a lab dish $\rightarrow$ **Zygote**.
+2. Zygote grows $\rightarrow$ **Embryo**.
+3. Embryo implanted in the **uterus**.
+
+
+* **ICSI (Intracytoplasmic Sperm Injection):** A single sperm is injected **directly into** an egg.
+
+---
+
+## **5. Local Biotech & Crops (Philippines Focus)**
+
+> 📌 **2003 Milestone:** The Philippines became the 1st country in its region to commercialize biotech crops.
+
+### **Bt Crops (Bt Corn, Bt Eggplant, Bt Cotton)**
+
+* **Bt (*Bacillus thuringiensis*):** A soil bacterium used as a natural source for pest-fighting genes.
+* **Cry1Ac Gene:** Bacterial gene inserted into crops to produce a natural pest toxin.
+* **Target Pests:** Corn borer & **EFSB** (Eggplant Fruit and Shoot Borer).
+
+### **Golden Rice (Malusog Rice)**
+
+* **Modification:** Engineered with corn and bacterial genes to make **Beta-carotene** (Vitamin A precursor).
+* **4 Main Goals (Memory Trick: "4 Vitamin A Fixes"):**
+1. Fight Vitamin A deficiency.
+2. Reduce child deaths.
 3. Prevent blindness.
-4. Strengthen overall immune systems.
+4. Boost immune system.
 
 
-
-### **Gene Therapy & Delivery Methods**
-
-* **Gene Therapy:** A genetic treatment method for hereditary or genetic diseases (e.g., hemophilia, cystic fibrosis, sickle cell anemia) that aims to modify or correct a patient's faulty genes rather than relying solely on traditional medical procedures or surgeries.
-* **In Vivo Gene Therapy:** The direct injection or delivery of therapeutic genetic material into the patient's body to target specific cells internally.
-* **Ex Vivo Gene Therapy:** A process where target cells are extracted from the patient, genetically altered in a laboratory environment, and then reinfused or reinserted back into the patient's body.
 
 ---
 
-## **Key Academic Terms Glossary**
+## **Quick-Recall Summary Table**
 
-* **Genetically Modified Organism (GMO):** An organism whose genetic material has been altered using genetic engineering technology.
-* **Cry1Ac Gene:** The specific bacterial gene responsible for producing insecticidal proteins in Bt crops.
-* **Bacillus thuringiensis (Bt):** A soil-dwelling bacterium used as a natural source for insect-resistant genes.
-* **Bt Corn / Bt Eggplant / Bt Cotton:** Crops genetically engineered with bacterial genes to resist destructive agricultural pests.
-* **Eggplant Fruit and Shoot Borer (EFSB):** A major pest targeted by genetic modification in eggplant varieties.
-* **Golden Rice / Malusog Rice:** Biofortified rice engineered to produce beta-carotene.
-* **Beta-carotene / Vitamin A Precursor:** A biological compound converted by the body into Vitamin A.
-* **Gene Therapy:** Medical intervention that alters gene expression to treat or cure genetic disorders.
-* **In Vivo Gene Therapy:** Direct in-body gene delivery.
-* **Ex Vivo Gene Therapy:** Laboratory-based genetic modification of extracted cells prior to reintroduction.
-* **Hemophilia:** A hereditary genetic disorder impairing the body's ability to control blood clotting.
-* **Cystic Fibrosis:** A progressive, genetic disease causing persistent lung damage and restricting breathing passageways.
-* **Sickle Cell Anemia:** A group of inherited red blood cell disorders characterized by misshapen cells that restrict healthy blood flow.
-
-
-
-### **Local Applications & Examples in the Philippines**
-
-* Mentioned Genetically Modified Organisms (GMOs) developed or utilized in the country include corn, eggplants (*talong*), and rice.
+| Term | Shortcut Memory Hook |
+| --- | --- |
+| **PCR** | "DNA Photocopy machine" |
+| **In Vivo vs. Ex Vivo** | *In Vivo* = In body / *Ex Vivo* = Out of body |
+| **Bt (*Bacillus thuringiensis*)** | Soil bacteria that kills pests |
+| **Cry1Ac Gene** | The pest-killing gene inside Bt crops |
+| **Golden Rice** | Beta-carotene $\rightarrow$ Vitamin A $\rightarrow$ Prevents blindness |
+| **Polymorphic Markers** | Unique DNA tags used in DNA fingerprinting |
