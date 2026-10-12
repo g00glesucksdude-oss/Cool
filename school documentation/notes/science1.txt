@@ -54,6 +54,54 @@ Here are your study notes for the **Science** section based on the provided mate
 
 * **Intracytoplasmic Sperm Injection (ICSI):** A specialized form of IVF where a single sperm cell is injected directly into an egg cell.
 
+Here are your comprehensive study notes for the **Science** section, incorporating the additional core concepts and academic terms provided:
+
+---
+
+## **Modern Biotechnology & Genetic Engineering**
+
+### **Primary Concepts & Goals**
+
+* **Modern Biotechnology Goals:** The direct manipulation and alteration of genetic material (DNA, cells, organisms) in a laboratory setting to solve biological problems (such as diseases caused by viruses or bacteria) and produce desired traits.
+* **Genetically Modified Organisms (GMOs / GMO Products):** Organisms whose DNA has been altered in a laboratory using genetic engineering techniques to enhance existing traits or introduce new ones (e.g., increased nutritional value, pest resistance, herbicide tolerance).
+
+### **Local GMO Crops in the Philippines**
+
+* In 2003, the Philippines became the first country in its region to commercialize and cultivate biotech crops, modifying key staples including corn, eggplant, cotton, and rice.
+* **Cry1Ac Gene:** A gene derived from the soil bacterium *Bacillus thuringiensis* (Bt) that is inserted into plants to enable toxin production, effectively deterring specific destructive pests.
+* **Bt Crops:** Bt corn, Bt eggplant, and Bt cotton are genetically modified to protect against pests like the corn borer and the eggplant fruit and shoot borer (EFSB), thereby safeguarding crop quality and yield.
+* **Golden Rice (Malusog Rice):** Genetically enhanced rice containing inserted genes from corn and bacteria to synthesize beta-carotene (a precursor to Vitamin A). Its main objectives are to:
+1. Combat Vitamin A deficiency.
+2. Reduce childhood mortality.
+3. Prevent blindness.
+4. Strengthen overall immune systems.
+
+
+
+### **Gene Therapy & Delivery Methods**
+
+* **Gene Therapy:** A genetic treatment method for hereditary or genetic diseases (e.g., hemophilia, cystic fibrosis, sickle cell anemia) that aims to modify or correct a patient's faulty genes rather than relying solely on traditional medical procedures or surgeries.
+* **In Vivo Gene Therapy:** The direct injection or delivery of therapeutic genetic material into the patient's body to target specific cells internally.
+* **Ex Vivo Gene Therapy:** A process where target cells are extracted from the patient, genetically altered in a laboratory environment, and then reinfused or reinserted back into the patient's body.
+
+---
+
+## **Key Academic Terms Glossary**
+
+* **Genetically Modified Organism (GMO):** An organism whose genetic material has been altered using genetic engineering technology.
+* **Cry1Ac Gene:** The specific bacterial gene responsible for producing insecticidal proteins in Bt crops.
+* **Bacillus thuringiensis (Bt):** A soil-dwelling bacterium used as a natural source for insect-resistant genes.
+* **Bt Corn / Bt Eggplant / Bt Cotton:** Crops genetically engineered with bacterial genes to resist destructive agricultural pests.
+* **Eggplant Fruit and Shoot Borer (EFSB):** A major pest targeted by genetic modification in eggplant varieties.
+* **Golden Rice / Malusog Rice:** Biofortified rice engineered to produce beta-carotene.
+* **Beta-carotene / Vitamin A Precursor:** A biological compound converted by the body into Vitamin A.
+* **Gene Therapy:** Medical intervention that alters gene expression to treat or cure genetic disorders.
+* **In Vivo Gene Therapy:** Direct in-body gene delivery.
+* **Ex Vivo Gene Therapy:** Laboratory-based genetic modification of extracted cells prior to reintroduction.
+* **Hemophilia:** A hereditary genetic disorder impairing the body's ability to control blood clotting.
+* **Cystic Fibrosis:** A progressive, genetic disease causing persistent lung damage and restricting breathing passageways.
+* **Sickle Cell Anemia:** A group of inherited red blood cell disorders characterized by misshapen cells that restrict healthy blood flow.
+
 
 
 ### **Local Applications & Examples in the Philippines**
