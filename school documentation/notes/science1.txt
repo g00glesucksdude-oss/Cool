@@ -1,0 +1,61 @@
+Here are your study notes for the **Science** section based on the provided material:
+
+---
+
+## **Modern Biotechnology & Genetic Engineering**
+
+### **Core Definition**
+
+* **Modern Biotechnology:** The manipulation of genetic material (DNA, genes, cells, and microorganisms) using advanced techniques to alter an organism's traits, commonly referred to as genetic engineering.
+
+
+
+### **Key Techniques & Processes**
+
+* **DNA Fingerprinting:**
+* Used to identify individuals based on their unique DNA sequences.
+
+
+* While organisms of the same species share similar general sequences, individual uniqueness is determined by **polymorphic markers**.
+
+
+* Common biological samples collected for testing include blood, saliva, urine, hair follicles, and semen.
+
+
+
+
+* **Polymerase Chain Reaction (PCR):** Also known as **molecular photocopying**, a laboratory technique used to generate millions or billions of copies of a specific DNA segment.
+
+
+* **Gene Therapy:** A treatment method for genetic diseases designed to avoid major medical procedures or surgery by inserting genetic material into a patient's cells.
+
+
+* **In Vivo Gene Therapy:** Genetic material is packaged and injected *directly* into the patient's body without removing cells.
+
+
+* **Ex Vivo Gene Therapy:** Cells are removed from the patient's body, altered in a laboratory setting, and then returned.
+
+
+
+
+
+### **Reproductive Technologies**
+
+* **In Vitro Fertilization (IVF):** A technique where an egg cell and a sperm cell are fertilized outside the body in a controlled laboratory Petri dish.
+
+
+* The fertilized egg becomes a **zygote**, which develops into an **embryo**.
+
+
+* The embryo is subsequently transferred and implanted into the female's uterus.
+
+
+
+
+* **Intracytoplasmic Sperm Injection (ICSI):** A specialized form of IVF where a single sperm cell is injected directly into an egg cell.
+
+
+
+### **Local Applications & Examples in the Philippines**
+
+* Mentioned Genetically Modified Organisms (GMOs) developed or utilized in the country include corn, eggplants (*talong*), and rice.
