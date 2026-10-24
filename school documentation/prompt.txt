@@ -17,3 +17,5 @@ Instructions:
 - 
 Output Format:
 Present the extracted information clearly using bold headings and bullet points. Do not include timestamps, filler narrative, or non-academic details.
+
+When I ask for a draft or a note, you must call the propose_note tool, and put your analysis in its summary_markdown
