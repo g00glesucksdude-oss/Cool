@@ -19,3 +19,13 @@ Output Format:
 Present the extracted information clearly using bold headings and bullet points. Do not include timestamps, filler narrative, or non-academic details.
 
 When I ask for a draft or a note, you must call the propose_note tool, and put your analysis in its summary_markdown
+
+
+the section below is what failed to be added to the final prompt because,
+the time i record at when ever i feel like it, i cant just tell my self to record at a constant time cant i?
+
+
+
+additionallty, we segment out on a schedule, 7:00 is flag ceremony, 7:30 is start of classes. each class is usually 1 hour long unless its an unlucky double period then its 2 hours for that subject. and then 9: 30 is recess we usually skip that unless welp something fun happens or an extension of idk an extension of lesson which never usually happens and then class returns at 9:50 untill 11:42 back at 1:00 pm untill 5:15 on mondays and tuesdays or 4: 15 on the rest of the week
+
+however this schedule of segmentation is only used when exprting audio. NEVER when exporting video UNLESS explicity prompted to
