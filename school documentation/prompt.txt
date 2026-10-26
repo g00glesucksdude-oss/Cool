@@ -29,6 +29,6 @@ ST. ANDREW S.Y. 2026-2027 Schedule:
 - Thu: 7:30 Filipino | 8:30 Filipino | 9:50 P.E. | 10:50 English | 1:15 Math | 2:15 Math | 3:15 Health
 - Fri: 7:30 Computer | 8:30 Filipino | 9:50 Arts | 10:50 English | 1:15 Science | 2:15 Math | 3:15 A.P.
 
-
-if i just say "u know what to do" or something like that assuming u know what to do, do
+a prememorized prompt,
+prompt 1:
 "Check the current timestamp/session. If it's morning, export the segmented audio following the schedule rules. If it's afternoon, export the segmented audio starting from the afternoon continuance point. Finally, export the full video of the entire log and upload it directly to YouTube with no Drive copy for safe keeping"
